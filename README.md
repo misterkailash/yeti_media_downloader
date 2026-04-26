@@ -2,7 +2,7 @@
 
 A sleek, all-in-one social media downloader that lets you save profile pictures, posts, reels, stories, and videos from multiple platforms — all from a single Vue-powered interface.
 
-![Yeti Media Downloader](screenshot.png)
+![Yeti Media Downloader](screen.png)
 
 ## Supported Platforms
 
