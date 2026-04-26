@@ -1,0 +1,26 @@
+{
+  "name": "yeti-media-downloader",
+  "version": "1.0.0",
+  "description": "Multi-platform media downloader (Instagram, Facebook, Threads, TikTok, VSCO)",
+  "main": "server.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "server": "node server.js",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "Kailash",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.2.1",
+    "sharp": "^0.34.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.6",
+    "pinia": "^3.0.4",
+    "vite": "^8.0.8",
+    "vue": "^3.5.33"
+  }
+}
