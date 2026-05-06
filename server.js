@@ -62,13 +62,16 @@ function httpsGet(url, headers = {}) {
 
 function decodeHtmlEntities(str) {
   return str
-    .replace(/&#064;/g, '@')
-    .replace(/&#x2022;/g, '•')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+      try { return String.fromCodePoint(parseInt(hex, 16)); } catch { return _; }
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      try { return String.fromCodePoint(parseInt(dec, 10)); } catch { return _; }
+    })
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+    .replace(/&quot;/g, '"');
 }
 
 function formatCount(n) {
@@ -765,6 +768,25 @@ app.get('/api/ig-search', async (req, res) => {
   res.json({ users: [] });
 });
 
+// IG dropped the inline JSON from public profile HTML, so the `"is_private":true`
+// regex no longer fires. web_profile_info still returns the flag without auth.
+async function checkIsPrivateWeb(username) {
+  try {
+    const r = await httpsGet(`https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`, {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      'x-ig-app-id': '936619743392459',
+      'Accept': '*/*',
+    });
+    if (r.status !== 200) return null;
+    const j = JSON.parse(r.body);
+    const u = j?.data?.user;
+    if (!u) return null;
+    return !!u.is_private;
+  } catch (_) {
+    return null;
+  }
+}
+
 // ---------- Instagram Posts / Reels ----------
 app.get('/api/ig-posts/:username', async (req, res) => {
   const { username } = req.params;
@@ -784,8 +806,13 @@ app.get('/api/ig-posts/:username', async (req, res) => {
     }
     const userId = userIdMatch[1];
 
-    // Detect private account from page HTML
-    const isPrivate = /"is_private"\s*:\s*true/.test(html);
+    // Detect private account: HTML inline JSON (legacy) → web_profile_info fallback.
+    // Skip the API call for paginated requests (max_id) since first page already decided.
+    let isPrivate = /"is_private"\s*:\s*true/.test(html);
+    if (!isPrivate && !maxId) {
+      const apiPriv = await checkIsPrivateWeb(username);
+      if (apiPriv === true) isPrivate = true;
+    }
 
     // Try authenticated API first for posts
     if (IG_SESSIONID) {
@@ -803,6 +830,11 @@ app.get('/api/ig-posts/:username', async (req, res) => {
           });
         }
         if (result.private) {
+          return res.json({ posts: [], private: true, next_max_id: null });
+        }
+        // /feed/user/ omits is_private for non-followers, so an empty result on
+        // an HTML-flagged private account means "locked", not "no posts".
+        if (isPrivate && (!result.posts || result.posts.length === 0)) {
           return res.json({ posts: [], private: true, next_max_id: null });
         }
         return res.json({ posts: result.posts, next_max_id: result.nextMaxId || null });
@@ -1610,6 +1642,19 @@ function httpHead(url, headers, hops = 0) {
   });
 }
 
+// Find an <a href="..."> in an HTML fragment whose class attribute contains
+// `klass`. Uses lookahead so href can appear before OR after class — the old
+// "href first, then class" regex silently missed HD links whenever ssstik
+// reordered attributes, which dropped us to SD or to the tikwm fallback.
+function findHrefByClass(html, klass) {
+  const re = new RegExp(
+    `<a\\b(?=[^>]*\\bclass="[^"]*\\b${klass}\\b[^"]*")[^>]*?\\bhref="([^"]+)"`,
+    'i'
+  );
+  const m = html.match(re);
+  return m ? m[1] : null;
+}
+
 // ssstik.io uses a 2-step CSRF token flow to call TikTok's web API with
 // proper signing on its end, then exposes the original CDN URL via a
 // tikcdn.io redirector. This is what most "tikdownloader" sites use under
@@ -1657,10 +1702,10 @@ function fetchSsstik(videoUrl) {
           let body = '';
           dlRes.on('data', c => body += c);
           dlRes.on('end', () => {
-            // ssstik returns HTML fragments — match the HD link first, fall back to SD
-            const hdMatch = body.match(/href="([^"]+)"[^>]*class="[^"]*without_watermark_hd[^"]*"/);
-            const sdMatch = body.match(/href="([^"]+)"[^>]*class="[^"]*without_watermark(?!_hd)[^"]*"/);
-            const url = (hdMatch && hdMatch[1]) || (sdMatch && sdMatch[1]);
+            // ssstik returns HTML fragments — prefer HD over SD no-watermark
+            const hdUrl = findHrefByClass(body, 'without_watermark_hd');
+            const sdUrl = !hdUrl ? findHrefByClass(body, 'without_watermark') : null;
+            const url = hdUrl || sdUrl;
             if (!url) {
               console.warn('[ssstik] no download links in response');
               return resolve(null);
@@ -1671,7 +1716,7 @@ function fetchSsstik(videoUrl) {
             const authorMatch = body.match(/<h2>([^<]+)<\/h2>/);
             resolve({
               url,
-              isHd: !!hdMatch,
+              isHd: !!hdUrl,
               title:  titleMatch  ? decodeHtmlEntities(titleMatch[1].replace(/<[^>]+>/g, '')).trim() : '',
               cover:  coverMatch  ? coverMatch[1] : '',
               author: authorMatch ? authorMatch[1].trim() : '',
@@ -1686,6 +1731,121 @@ function fetchSsstik(videoUrl) {
     });
     pageReq.on('error', (e) => { console.warn(`[ssstik] page: ${e.message}`); resolve(null); });
     pageReq.setTimeout(10000, () => { pageReq.destroy(); resolve(null); });
+  });
+}
+
+// tikdownloader.io's HD button points at dl.snapcdn.app/get?token=<JWT>.
+// The JWT payload is `{"url": "<real TikTok CDN URL>"}` — the URL ends with
+// `_origin/...` which is the un-watermarked 1080p original. Decoding the
+// JWT bypasses snapcdn entirely so the browser pulls straight from the
+// TikTok CDN at full speed.
+function decodeSnapcdnJwtUrl(redirectorUrl) {
+  try {
+    const m = redirectorUrl.match(/[?&]token=([^&#]+)/);
+    if (!m) return null;
+    const token = decodeURIComponent(m[1]);
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    let payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    payload += '='.repeat((4 - payload.length % 4) % 4);
+    const j = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    return (j && j.url) || null;
+  } catch (_) { return null; }
+}
+
+// tikdownloader.io calls TikTok's signed mobile API on its end and returns
+// three anchor variants per video: "MP4 [1]" (snapcdn proxy, low bitrate),
+// "MP4 [2]" (direct CDN, also non-HD), and "MP4 HD" (snapcdn → JWT → real
+// TikTok CDN with `_origin` suffix = un-watermarked 1080p original).
+// We pick HD by matching the "HD" label in the anchor text, then decode
+// the JWT to skip the snapcdn redirector. ssstik's HD is Cloudflare-gated
+// so this is the more reliable HD path.
+function fetchTikdownloader(videoUrl) {
+  return new Promise((resolve) => {
+    // CF bot rules on tikdownloader.io blacklist the literal substring
+    // "(KHTML, like Gecko)" — even though that's part of every real Chrome
+    // UA, they've apparently flagged it because so many bots copy the
+    // canonical UA verbatim. Dropping that substring → 200 OK every time.
+    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+    const postData = `q=${encodeURIComponent(videoUrl)}&lang=en`;
+    const req = https.request({
+      host: 'tikdownloader.io',
+      path: '/api/ajaxSearch',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData),
+        'User-Agent': ua,
+        'Accept': '*/*',
+        'Origin': 'https://tikdownloader.io',
+        'Referer': 'https://tikdownloader.io/en',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      rejectUnauthorized: false,
+    }, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) {
+            console.warn(`[tikdownloader] http=${res.statusCode}`);
+            return resolve(null);
+          }
+          const j = JSON.parse(body);
+          if (!j || j.status !== 'ok' || !j.data) {
+            if (j && j.mess) console.warn(`[tikdownloader] ${j.mess}`);
+            return resolve(null);
+          }
+          const html = j.data;
+
+          // Walk every anchor and bucket by label. "HD" is the original 1080p,
+          // "MP4 [2]" / direct CDN URLs are mid-bitrate, "MP4 [1]" via snapcdn
+          // is the lowest-bitrate variant. Skip MP3/music anchors entirely.
+          const allAnchors = [...html.matchAll(/<a\b[^>]*\bhref="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)];
+          let hdUrl = null;
+          let directCdnUrl = null;
+          let anySnapcdnUrl = null;
+          for (const m of allAnchors) {
+            const href = m[1];
+            const text = m[2].replace(/<[^>]+>/g, '').trim();
+            if (!/^https?:\/\//.test(href)) continue;
+            if (/mp3|music|audio/i.test(text) || /\.mp3(\?|$)/i.test(href)) continue;
+            const isSnapcdn = /(?:^|\/\/)[^/]*snapcdn\.app\//i.test(href);
+            const isHdText  = /\bHD\b/i.test(text);
+            if (isHdText && !hdUrl) hdUrl = href;
+            else if (!directCdnUrl && /tikcdn|tiktokcdn|byteoversea|tokcdn|akamaized/.test(href) && !isSnapcdn) directCdnUrl = href;
+            else if (isSnapcdn && !anySnapcdnUrl) anySnapcdnUrl = href;
+          }
+
+          // Resolve snapcdn JWT to the underlying _origin CDN URL when present
+          let url = hdUrl || directCdnUrl || anySnapcdnUrl;
+          if (url && /snapcdn\.app/i.test(url)) {
+            const decoded = decodeSnapcdnJwtUrl(url);
+            if (decoded) url = decoded;
+          }
+          if (!url) {
+            console.warn('[tikdownloader] no download links in fragment');
+            return resolve(null);
+          }
+          const titleMatch  = html.match(/<h3[^>]*>([\s\S]*?)<\/h3>/) || html.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+          const coverMatch  = html.match(/<img[^>]*src="([^"]+)"/);
+          resolve({
+            url,
+            isHd: !!hdUrl,
+            title:  titleMatch ? decodeHtmlEntities(titleMatch[1].replace(/<[^>]+>/g, '')).trim() : '',
+            cover:  coverMatch ? decodeHtmlEntities(coverMatch[1]) : '',
+            author: '',
+          });
+        } catch (e) {
+          console.warn(`[tikdownloader] parse: ${e.message}`);
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', (e) => { console.warn(`[tikdownloader] ${e.message}`); resolve(null); });
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    req.write(postData);
+    req.end();
   });
 }
 
@@ -1874,31 +2034,45 @@ app.get('/api/tt-video', async (req, res) => {
     }
     const videoId = idMatch[1];
 
-    // Primary path: ssstik.io → ORIGINAL 1080p no-watermark via TikTok's own CDN
-    const ssstik = await fetchSsstik(resolvedUrl);
-    if (ssstik && ssstik.url) {
+    // Primary path: race ssstik.io and tikdownloader.io in parallel — both
+    // return ORIGINAL 1080p no-watermark via TikTok's own CDN (via tikcdn.io
+    // redirector). Prefer whichever returns an HD link; fall back to either's
+    // SD link before dropping to lower-tier extractors. Either extractor
+    // occasionally fails on a given URL (region/CSRF/rate-limit), so running
+    // both concurrently is the difference between "HD" and "tikwm 720p".
+    const [ssstik, tikdl] = await Promise.all([
+      fetchSsstik(resolvedUrl).catch(() => null),
+      fetchTikdownloader(resolvedUrl).catch(() => null),
+    ]);
+    const primary =
+      (ssstik && ssstik.isHd && ssstik) ||
+      (tikdl  && tikdl.isHd  && tikdl)  ||
+      ssstik || tikdl;
+    if (primary && primary.url) {
+      const sourceName = primary === ssstik ? 'ssstik' : 'tikdownloader';
+      const referer = sourceName === 'ssstik' ? 'https://ssstik.io/' : 'https://tikdownloader.io/';
       // HEAD-follow to resolve tikcdn.io → final TikTok CDN URL + exact size
-      const final = await httpHead(ssstik.url, {
+      const final = await httpHead(primary.url, {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://ssstik.io/',
+        'Referer': referer,
       });
-      console.log(`[tt-video] ${videoId} → ssstik (HD: ${ssstik.isHd}, ${final.size} bytes)`);
+      console.log(`[tt-video] ${videoId} → ${sourceName} (HD: ${primary.isHd}, ${final.size} bytes)`);
       return res.json({
         id: videoId,
-        author: ssstik.author || '',
-        nickname: ssstik.author || '',
-        description: ssstik.title || '',
-        cover: ssstik.cover || '',
+        author: primary.author || '',
+        nickname: primary.author || '',
+        description: primary.title || '',
+        cover: primary.cover || '',
         duration: 0,
         width: 0,
         height: 0,
         bitrate: 0,
         codec: '',
         sizeBytes: final.size,
-        downloadUrl: final.url || ssstik.url,
+        downloadUrl: final.url || primary.url,
         watermark: false,
-        quality: ssstik.isHd ? 'Original HD' : 'No Watermark',
-        source: 'ssstik',
+        quality: primary.isHd ? 'Original HD' : 'No Watermark',
+        source: sourceName,
       });
     }
 
@@ -2064,7 +2238,7 @@ app.get('/api/tt-video', async (req, res) => {
 
 // Streams a TikTok CDN video URL with the required Referer header,
 // forwarding Range requests and following redirects (tikcdn.io → real CDN).
-const TT_VIDEO_HOST_RE = /^https:\/\/[^/]*(tiktokcdn\.com|tiktokcdn-us\.com|tiktokv\.com|byteoversea\.com|muscdn\.com|tikwm\.com|tikcdn\.io|akamaized\.net)\//;
+const TT_VIDEO_HOST_RE = /^https:\/\/[^/]*(tiktokcdn\.com|tiktokcdn-us\.com|tiktokv\.com|byteoversea\.com|muscdn\.com|tikwm\.com|tikcdn\.io|tokcdn\.com|akamaized\.net)\//;
 
 app.get('/api/tt-video-proxy', (req, res) => {
   const target = req.query.url;
@@ -2100,6 +2274,65 @@ app.get('/api/tt-video-proxy', (req, res) => {
     };
     https.get(opts, (upstream) => {
       // Follow redirects (tikcdn.io → akamaized.net → tiktokcdn.com etc)
+      if (upstream.statusCode >= 300 && upstream.statusCode < 400 && upstream.headers.location) {
+        upstream.resume();
+        const next = upstream.headers.location.startsWith('http')
+                   ? upstream.headers.location
+                   : `https://${u.host}${upstream.headers.location}`;
+        return attempt(next, hops + 1);
+      }
+      if (upstream.statusCode !== 200 && upstream.statusCode !== 206) {
+        if (!headersSent) res.status(upstream.statusCode || 502).end();
+        upstream.resume();
+        return;
+      }
+      headersSent = true;
+      res.status(upstream.statusCode);
+      res.setHeader('Content-Type', upstream.headers['content-type'] || 'video/mp4');
+      if (upstream.headers['content-length']) res.setHeader('Content-Length', upstream.headers['content-length']);
+      if (upstream.headers['content-range'])  res.setHeader('Content-Range',  upstream.headers['content-range']);
+      if (upstream.headers['accept-ranges'])  res.setHeader('Accept-Ranges',  upstream.headers['accept-ranges']);
+      res.setHeader('Content-Disposition', `attachment; filename="${safe}.mp4"`);
+      upstream.pipe(res);
+    }).on('error', () => { if (!headersSent) res.status(502).end(); });
+  }
+
+  attempt(target, 0);
+});
+
+const IG_VIDEO_HOST_RE = /^https:\/\/[^/]*(fbcdn\.net|cdninstagram\.com)\//;
+
+app.get('/api/ig-video-proxy', (req, res) => {
+  const target = req.query.url;
+  const name = req.query.name;
+  if (!target || !IG_VIDEO_HOST_RE.test(target)) {
+    return res.status(400).send('bad url');
+  }
+
+  const safe = name ? String(name).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100) : `ig_${Date.now()}`;
+  let headersSent = false;
+
+  function attempt(url, hops) {
+    if (hops > 5) {
+      if (!headersSent) res.status(508).end();
+      return;
+    }
+    if (!IG_VIDEO_HOST_RE.test(url)) {
+      if (!headersSent) res.status(400).end();
+      return;
+    }
+    const u = new URL(url);
+    const opts = {
+      host: u.host,
+      path: u.pathname + u.search,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Range': req.headers.range || 'bytes=0-',
+      },
+      rejectUnauthorized: false,
+    };
+    https.get(opts, (upstream) => {
       if (upstream.statusCode >= 300 && upstream.statusCode < 400 && upstream.headers.location) {
         upstream.resume();
         const next = upstream.headers.location.startsWith('http')

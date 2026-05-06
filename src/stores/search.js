@@ -174,6 +174,8 @@ export const useSearchStore = defineStore('search', () => {
           username: '@' + (data.username || handle),
           meta,
           handle,
+          picWidth: data.pic_width || 0,
+          downloadName: fileName + '.jpg',
         };
 
         if (platform.current === 'instagram') {

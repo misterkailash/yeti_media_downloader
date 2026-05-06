@@ -6,7 +6,10 @@ import { usePostsStore } from '../stores/posts';
 
 const storiesStore = useStoriesStore();
 const posts = usePostsStore();
-const { viewerOpen, viewerItems, viewerIndex, viewerHandle } = storeToRefs(storiesStore);
+const {
+  viewerOpen, viewerItems, viewerIndex, viewerHandle, viewerKind,
+  dlAllRunning, dlAllDone, dlAllTotal, dlAllErrors,
+} = storeToRefs(storiesStore);
 
 const currentItem = computed(() => viewerItems.value[viewerIndex.value]);
 
@@ -21,6 +24,15 @@ const mediaSrc = computed(() => {
   return thumb(item.thumbnail);
 });
 const isVideo = computed(() => currentItem.value?.type === 'video' && currentItem.value?.videoUrl);
+const hasPrev = computed(() => viewerIndex.value > 0);
+const hasNext = computed(() => viewerIndex.value < viewerItems.value.length - 1);
+const showBulk = computed(() => viewerKind.value === 'highlight' && viewerItems.value.length > 1);
+const bulkLabel = computed(() => {
+  if (!dlAllRunning.value) return `Download all (${viewerItems.value.length})`;
+  if (dlAllTotal.value === 0) return 'Preparing…';
+  const base = `${dlAllDone.value} / ${dlAllTotal.value}`;
+  return dlAllErrors.value ? `${base} (${dlAllErrors.value} failed)` : base;
+});
 
 const downloadHref = computed(() => mediaSrc.value);
 const downloadName = computed(() => {
@@ -89,6 +101,22 @@ onUnmounted(() => document.removeEventListener('keydown', onKey));
           <button class="sv-prev" @click="storiesStore.prevItem()"></button>
           <button class="sv-next" @click="storiesStore.nextItem()"></button>
         </div>
+        <button
+          v-if="hasPrev"
+          class="sv-chev sv-chev-prev"
+          aria-label="Previous"
+          @click.stop="storiesStore.prevItem()"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <button
+          v-if="hasNext"
+          class="sv-chev sv-chev-next"
+          aria-label="Next"
+          @click.stop="storiesStore.nextItem()"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
       </div>
       <div class="sv-actions">
         <a class="sv-dl" :href="downloadHref" :download="downloadName" @click="onDownload">
@@ -97,6 +125,15 @@ onUnmounted(() => document.removeEventListener('keydown', onKey));
           </svg>
           Download
         </a>
+        <button
+          v-if="showBulk"
+          class="sv-dl-all"
+          :disabled="dlAllRunning"
+          @click="storiesStore.downloadCurrentReel()"
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          {{ bulkLabel }}
+        </button>
         <button class="sv-close" @click="storiesStore.closeViewer()">Close</button>
       </div>
       <div class="sv-counter">{{ viewerIndex + 1 }} / {{ viewerItems.length }}</div>
