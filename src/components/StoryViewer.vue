@@ -119,7 +119,7 @@ onUnmounted(() => document.removeEventListener('keydown', onKey));
         </button>
       </div>
       <div class="sv-actions">
-        <a class="sv-dl" :href="downloadHref" :download="downloadName" @click="onDownload">
+        <a class="sv-dl" :href="downloadHref" @click="onDownload">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/>
           </svg>

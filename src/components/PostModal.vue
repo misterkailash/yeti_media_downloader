@@ -9,6 +9,9 @@ const { modalOpen, modalPost, modalCaption, currentHandle, carouselIndex } = sto
 const sliderRef = ref(null);
 const downloadingAll = ref(false);
 const downloadAllLabel = ref('');
+// Index into the active item's videoVersions[]. Reset to 0 (highest)
+// whenever the modal opens or the carousel slide changes.
+const selectedVersionIdx = ref(0);
 
 const isCarousel = computed(
   () => modalPost.value?.type === 'carousel' && modalPost.value.carouselItems?.length > 1
@@ -27,8 +30,36 @@ const carouselItems = computed(() => {
     videoUrl: ci.videoUrl ? thumb(ci.videoUrl) : null,
     rawUrl: ci.url,
     rawVideoUrl: ci.videoUrl,
+    videoVersions: ci.videoVersions || [],
   }));
 });
+
+// The video being viewed/downloaded right now. For non-carousel posts it's
+// the post itself; for carousels it's the slide at carouselIndex.
+const activeVideoVersions = computed(() => {
+  if (isCarousel.value) {
+    const ci = modalPost.value?.carouselItems?.[carouselIndex.value];
+    return ci?.videoVersions || [];
+  }
+  return modalPost.value?.videoVersions || [];
+});
+
+// Show the picker any time we have at least one version with a real
+// height — single-quality reels are common, and labeling the available
+// quality is more useful than silently hiding the row.
+const showQualityPicker = computed(() => {
+  const v = activeVideoVersions.value;
+  return v.length > 0 && v.some(x => x.height);
+});
+
+function qualityLabel(v, i) {
+  if (v.height) return `${v.height}p`;
+  return ['Best', 'High', 'Medium', 'Low'][i] || `Option ${i + 1}`;
+}
+
+function pickQuality(i) {
+  selectedVersionIdx.value = i;
+}
 
 const slidesLoaded = ref(new Set());
 function loadSlide(idx) {
@@ -41,9 +72,11 @@ watch(carouselIndex, (i) => {
   loadSlide(i);
   loadSlide(i + 1);
   loadSlide(i - 1);
+  selectedVersionIdx.value = 0;
 });
 
 watch(modalOpen, (open) => {
+  selectedVersionIdx.value = 0;
   if (open && isCarousel.value) {
     slidesLoaded.value = new Set();
     loadSlide(0);
@@ -52,31 +85,80 @@ watch(modalOpen, (open) => {
     downloadingAll.value = false;
     downloadAllLabel.value = '';
   }
+  if (open) fetchFullQualities();
 });
+
+// IG's profile feed serves a degraded video_versions list (reels capped
+// around 720x1280). When the modal opens we fire one extra call to the
+// per-media info endpoint and merge in the full quality list — same way
+// sealx etc surface 1080x1920 originals. Falls through silently if the
+// user isn't logged into IG (401) or the post isn't a video.
+async function fetchFullQualities() {
+  const post = modalPost.value;
+  if (!post || !post.code) return;
+  const hasVideo = post.videoUrl || (post.carouselItems || []).some(ci => ci.videoUrl);
+  if (!hasVideo) return;
+  try {
+    const r = await fetch('/api/ig-post-versions/' + encodeURIComponent(post.code));
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!post || post.code !== modalPost.value?.code) return; // modal switched
+    if (Array.isArray(data.videoVersions) && data.videoVersions.length) {
+      post.videoVersions = data.videoVersions;
+      // Top-level URL may have changed; keep the fallback consistent.
+      if (data.videoVersions[0].url) post.videoUrl = data.videoVersions[0].url;
+    }
+    if (Array.isArray(data.carousel) && Array.isArray(post.carouselItems)) {
+      post.carouselItems.forEach((ci, i) => {
+        const c = data.carousel[i];
+        if (c && Array.isArray(c.videoVersions) && c.videoVersions.length) {
+          ci.videoVersions = c.videoVersions;
+          ci.videoUrl = c.videoVersions[0].url;
+        }
+      });
+    }
+    // Reset the picker selection so the user lands on the new top quality
+    selectedVersionIdx.value = 0;
+  } catch (_) { /* ignore — picker just won't upgrade */ }
+}
+
+// Pass the bare basename (no extension) — the image-proxy adds the right
+// extension based on the actual response content-type (.mp4 / .jpg / etc).
+const downloadName = computed(() => {
+  if (!modalPost.value) return 'download';
+  if (isCarousel.value) {
+    const ci = modalPost.value.carouselItems[carouselIndex.value];
+    if (!ci) return 'download';
+    return posts.postFileName(currentHandle.value, modalPost.value, String(carouselIndex.value + 1), '');
+  }
+  return posts.postFileName(currentHandle.value, modalPost.value, null, '');
+});
+
+// `name=` is what makes the proxy stamp Content-Disposition: attachment.
+// Without it, browsers render videos/images inline (in a new tab) instead
+// of downloading.
+function proxiedDownload(url) {
+  return '/api/image-proxy?url=' + encodeURIComponent(url) + '&name=' + encodeURIComponent(downloadName.value);
+}
 
 const downloadHref = computed(() => {
   if (!modalPost.value) return '#';
   if (isCarousel.value) {
     const ci = modalPost.value.carouselItems[carouselIndex.value];
     if (!ci) return '#';
-    return ci.videoUrl
-      ? '/api/image-proxy?url=' + encodeURIComponent(ci.videoUrl)
-      : '/api/image-proxy?url=' + encodeURIComponent(ci.url);
+    if (ci.videoUrl) {
+      const versions = ci.videoVersions || [];
+      const chosen = versions[selectedVersionIdx.value]?.url || ci.videoUrl;
+      return proxiedDownload(chosen);
+    }
+    return proxiedDownload(ci.url);
   }
   if (modalPost.value.videoUrl) {
-    return '/api/image-proxy?url=' + encodeURIComponent(modalPost.value.videoUrl);
+    const versions = modalPost.value.videoVersions || [];
+    const chosen = versions[selectedVersionIdx.value]?.url || modalPost.value.videoUrl;
+    return proxiedDownload(chosen);
   }
-  return thumb(modalPost.value.thumbnail);
-});
-
-const downloadFileName = computed(() => {
-  if (!modalPost.value) return 'download';
-  if (isCarousel.value) {
-    const ci = modalPost.value.carouselItems[carouselIndex.value];
-    if (!ci) return 'download';
-    return posts.postFileName(currentHandle.value, modalPost.value, String(carouselIndex.value + 1), ci.videoUrl ? 'mp4' : 'jpg');
-  }
-  return posts.postFileName(currentHandle.value, modalPost.value, null, modalPost.value.videoUrl ? 'mp4' : 'jpg');
+  return proxiedDownload(modalPost.value.thumbnail);
 });
 
 async function gotoSlide(i) {
@@ -201,8 +283,22 @@ async function downloadAll() {
       </div>
       <div class="post-modal-body">
         <div class="caption">{{ modalCaption }}</div>
+        <div v-if="showQualityPicker" class="post-quality">
+          <div class="post-quality-label">Choose quality:</div>
+          <div class="post-quality-row">
+            <button
+              v-for="(v, i) in activeVideoVersions"
+              :key="i"
+              class="post-quality-btn"
+              :class="{ active: i === selectedVersionIdx }"
+              @click="pickQuality(i)"
+            >
+              {{ qualityLabel(v, i) }}
+            </button>
+          </div>
+        </div>
         <div class="post-actions">
-          <a class="btn-download" :href="downloadHref" :download="downloadFileName">
+          <a class="btn-download" :href="downloadHref">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/>
             </svg>
@@ -221,3 +317,44 @@ async function downloadAll() {
     </div>
   </div>
 </template>
+
+<style scoped>
+.post-quality {
+  margin: 12px 0 4px;
+  text-align: left;
+}
+.post-quality-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+.post-quality-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.post-quality-btn {
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 0.78rem;
+  font-weight: 600;
+  transition: all 0.15s ease;
+}
+.post-quality-btn:hover {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+.post-quality-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+</style>

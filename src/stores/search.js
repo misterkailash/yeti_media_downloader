@@ -115,7 +115,19 @@ export const useSearchStore = defineStore('search', () => {
 
     try {
       const res = await fetch(cfg.endpoint + encodeURIComponent(handle));
-      const data = await res.json();
+      let data;
+      try {
+        data = await res.json();
+      } catch (_) {
+        // Server returned non-JSON (typically Express's HTML 404). The
+        // most common cause is the server not being restarted after new
+        // endpoints were added.
+        throw new Error(
+          res.status === 404
+            ? 'Endpoint not found — restart the server (node server.js) to pick up new routes.'
+            : `Server returned ${res.status} (non-JSON). Check the server console.`
+        );
+      }
       if (!res.ok) throw new Error(data.error || 'Failed to fetch');
 
       if (cfg.kind === 'video') {
@@ -140,6 +152,214 @@ export const useSearchStore = defineStore('search', () => {
           downloadHref: '/api/tt-video-proxy?url=' + encodeURIComponent(data.downloadUrl) + '&name=' + encodeURIComponent(fileName),
           downloadName: fileName + '.mp4',
           downloadLabel: 'Download HD Video',
+        };
+      } else if (cfg.kind === 'youtube') {
+        // YouTube returns a list of qualities; pick the highest by default
+        // and let the user switch via the picker. Each pick rewrites the
+        // download URL to the matching itag.
+        // Use the video title as the filename — strip filesystem-illegal
+        // chars but keep spaces, parens, and other punctuation for
+        // readability. The server further handles Unicode via RFC 5987.
+        const rawName = data.title || `youtube_${data.id}`;
+        const fileName = rawName
+          .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 100);
+        const qualities = (data.qualities || []).map(q => ({
+          itag: q.itag,
+          label: q.label,
+          height: q.height,
+          fps: q.fps,
+          sizeBytes: q.sizeBytes,
+          sizeApprox: !!q.sizeApprox,
+          downloadHref: '/api/yt-stream?url=' + encodeURIComponent(handle)
+            + '&itag=' + q.itag
+            + '&name=' + encodeURIComponent(fileName),
+          // Used by the frontend's "Preparing X%" indicator while the
+          // server is muxing on demand.
+          ytUrl: handle,
+        }));
+        const top = qualities[0];
+        const badges = [];
+        if (top) badges.push({ text: top.label });
+        if (top && top.sizeBytes) {
+          const size = formatBytes(top.sizeBytes);
+          if (size) badges.push({ text: size });
+        }
+        if (data.duration) {
+          const m = Math.floor(data.duration / 60);
+          const s = String(data.duration % 60).padStart(2, '0');
+          badges.push({ text: `${m}:${s}` });
+        }
+
+        video.value = {
+          kind: 'youtube',
+          cover: '/api/image-proxy?url=' + encodeURIComponent(data.cover),
+          referrerPolicy: null,
+          nickname: data.title || '',
+          author: data.author ? data.author : '',
+          description: data.description || '',
+          badges,
+          qualities,
+          selectedItag: top ? top.itag : null,
+          downloadHref: top ? top.downloadHref : '',
+          downloadName: fileName + '.mp4',
+          downloadLabel: top ? `Download ${top.label}` : 'Download',
+        };
+      } else if (cfg.kind === 'fb-video') {
+        // Facebook videos: yt-dlp returns multiple DASH variants, the
+        // server hands them all back as `qualities` and the user picks.
+        // The mux/prepare flow is keyed on (url, formatId) so each
+        // quality has its own cached temp file.
+        const rawName = data.author && data.title
+          ? `${data.author} - ${data.title}`
+          : (data.title || data.author || `facebook_${data.id}`);
+        const fileName = rawName
+          .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 100);
+        const qualities = (data.qualities || []).map(q => ({
+          itag: q.formatId,
+          label: q.label,
+          height: q.height,
+          fps: q.fps,
+          sizeBytes: q.sizeBytes,
+          sizeApprox: !!q.sizeApprox,
+          downloadHref: '/api/fb-video-stream?url=' + encodeURIComponent(handle)
+            + '&formatId=' + encodeURIComponent(q.formatId)
+            + '&name=' + encodeURIComponent(fileName),
+        }));
+        const top = qualities[0];
+        const badges = [];
+        if (top) badges.push({ text: top.label });
+        if (top && top.sizeBytes) {
+          const size = formatBytes(top.sizeBytes);
+          if (size) badges.push({ text: top.sizeApprox ? `~${size}` : size });
+        }
+        if (data.duration) {
+          const m = Math.floor(data.duration / 60);
+          const s = String(data.duration % 60).padStart(2, '0');
+          badges.push({ text: `${m}:${s}` });
+        }
+
+        video.value = {
+          kind: 'fb-video',
+          cover: '/api/image-proxy?url=' + encodeURIComponent(data.cover),
+          referrerPolicy: null,
+          nickname: data.title || '',
+          author: data.author || '',
+          description: data.description || '',
+          badges,
+          qualities,
+          selectedItag: top ? top.itag : null,
+          downloadHref: top ? top.downloadHref : '',
+          downloadName: fileName + '.mp4',
+          downloadLabel: top ? `Download ${top.label}` : 'Download Video',
+        };
+      } else if (cfg.kind === 'reddit') {
+        // Reddit videos use the same yt-dlp + ffmpeg mux pipeline as
+        // YouTube — DASH video stream + separate DASH audio stream merged
+        // into a single mp4. The "Preparing X%" indicator polls
+        // /api/rd-prepare-status while we mux server-side.
+        const rawName = data.title || `reddit_${data.id}`;
+        const fileName = rawName
+          .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 100);
+        const badges = [];
+        if (data.height) badges.push({ text: `${data.height}p` });
+        const size = formatBytes(data.sizeBytes);
+        if (size) badges.push({ text: `~${size}` });
+        if (data.duration) {
+          const m = Math.floor(data.duration / 60);
+          const s = String(data.duration % 60).padStart(2, '0');
+          badges.push({ text: `${m}:${s}` });
+        }
+
+        video.value = {
+          // Reuse the youtube prepare-flow (same /api/.../-prepare-status
+          // pattern). VideoResult.PREPARE_ENDPOINTS keys on `kind`.
+          kind: 'reddit',
+          cover: '/api/image-proxy?url=' + encodeURIComponent(data.cover),
+          referrerPolicy: null,
+          nickname: data.title || '',
+          author: data.author ? 'u/' + data.author : '',
+          description: data.description || '',
+          badges,
+          downloadHref: '/api/rd-stream?url=' + encodeURIComponent(handle) + '&name=' + encodeURIComponent(fileName),
+          downloadName: fileName + '.mp4',
+          downloadLabel: 'Download Video',
+        };
+      } else if (cfg.kind === 'soundcloud') {
+        // SoundCloud: server transcodes to 320 kbps CBR MP3 via ffmpeg.
+        // Honesty caveat — transcoding from 128 kbps source doesn't add
+        // real audio quality, but the output file is genuinely 320 kbps.
+        const rawName = `${data.artist || 'soundcloud'} - ${data.title || 'track'}`;
+        const fileName = rawName
+          .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 100);
+        const badges = [];
+        badges.push({ text: '320 kbps MP3', clean: true });
+        if (data.sourceBitrate) badges.push({ text: `source ${data.sourceBitrate}kbps` });
+        const size = formatBytes(data.sizeBytes);
+        if (size) badges.push({ text: `~${size}` });
+        if (data.duration) {
+          const m = Math.floor(data.duration / 60);
+          const s = String(data.duration % 60).padStart(2, '0');
+          badges.push({ text: `${m}:${s}` });
+        }
+
+        video.value = {
+          kind: 'audio',
+          cover: '/api/image-proxy?url=' + encodeURIComponent(data.cover),
+          referrerPolicy: null,
+          nickname: data.title || '',
+          author: data.artist || '',
+          description: data.description || '',
+          badges,
+          downloadHref: '/api/sc-stream?url=' + encodeURIComponent(handle) + '&name=' + encodeURIComponent(fileName),
+          downloadName: fileName + '.mp3',
+          downloadLabel: 'Download MP3 (320 kbps)',
+          // Used by VideoResult's "Preparing X%" indicator while the
+          // server is transcoding. Same pattern as YouTube but for audio.
+          scUrl: handle,
+        };
+      } else if (cfg.kind === 'tweet') {
+        // X / Twitter: same response shape as TikTok video, but media may
+        // be a photo or a video. Branch on data.mediaType.
+        const fileName = `x_${data.author || 'tweet'}_${data.id}`;
+        const isVideo = data.mediaType === 'video';
+        const badges = [];
+        if (isVideo) {
+          if (data.height) badges.push({ text: `${data.height}p` });
+          if (data.bitrate) badges.push({ text: `${Math.round(data.bitrate / 1000)}kbps` });
+          const size = formatBytes(data.sizeBytes);
+          if (size) badges.push({ text: size });
+          if (data.duration) badges.push({ text: `${Math.round(data.duration)}s` });
+        } else {
+          badges.push({ text: 'original size', clean: true });
+          if (data.width && data.height) badges.push({ text: `${data.width}×${data.height}` });
+        }
+        if (data.mediaCount > 1) badges.push({ text: `1 of ${data.mediaCount}` });
+
+        video.value = {
+          kind: isVideo ? 'video' : 'image',
+          cover: '/api/image-proxy?url=' + encodeURIComponent(data.cover || data.downloadUrl),
+          referrerPolicy: null,
+          nickname: data.nickname || data.author || '',
+          author: data.author ? '@' + data.author : '',
+          description: data.description || '',
+          badges,
+          downloadHref: isVideo
+            ? '/api/tt-video-proxy?url=' + encodeURIComponent(data.downloadUrl) + '&name=' + encodeURIComponent(fileName)
+            : '/api/image-proxy?url=' + encodeURIComponent(data.downloadUrl) + '&name=' + encodeURIComponent(fileName),
+          downloadName: fileName + (isVideo ? '.mp4' : '.jpg'),
+          downloadLabel: isVideo ? 'Download Video' : 'Download Image',
         };
       } else if (cfg.kind === 'image') {
         const fileName = `vsco_${data.author || 'post'}_${data.id || Date.now()}`;

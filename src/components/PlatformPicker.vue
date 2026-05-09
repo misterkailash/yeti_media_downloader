@@ -11,8 +11,12 @@ import facebook from '../assets/facebook.png';
 import tiktok from '../assets/tiktok.png';
 import threads from '../assets/threads.png';
 import vsco from '../assets/vsco.png';
+import x from '../assets/x.png';
+import youtube from '../assets/youtube.png';
+import soundcloud from '../assets/soundcloud.png';
+import reddit from '../assets/reddit.png';
 
-const ICONS = { 'instagram.png': instagram, 'facebook.png': facebook, 'tiktok.png': tiktok, 'threads.png': threads, 'vsco.png': vsco };
+const ICONS = { 'instagram.png': instagram, 'facebook.png': facebook, 'tiktok.png': tiktok, 'threads.png': threads, 'vsco.png': vsco, 'x.png': x, 'youtube.png': youtube, 'soundcloud.png': soundcloud, 'reddit.png': reddit };
 
 const platform = usePlatformStore();
 const search = useSearchStore();

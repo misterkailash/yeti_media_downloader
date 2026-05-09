@@ -3,6 +3,11 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
+const youtubedl = require('youtube-dl-exec');
+const ffmpegPath = require('ffmpeg-static');
+const { spawn } = require('child_process');
+const os = require('os');
+const ytdlpPath = youtubedl.constants && youtubedl.constants.YOUTUBE_DL_PATH;
 const app = express();
 const PORT = 3000;
 
@@ -17,6 +22,11 @@ let FB_COOKIES = ''; // c_user + xs cookies
 let FB_ACCESS_TOKEN = ''; // Graph API access token
 let FB_USER_ID = '';
 let fbLoggedUsername = '';
+// TikTok session (sessionid + tt-target-idc cookies — used by future
+// yt-dlp-based extractors for private/age-gated content)
+let TT_COOKIES = '';
+let TT_USER_ID = '';
+let ttLoggedUsername = '';
 try {
   const envText = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
   const m = envText.match(/^\s*IG_SESSIONID\s*=\s*(.+?)\s*$/m);
@@ -27,6 +37,10 @@ try {
   if (fbu) fbLoggedUsername = fbu[1].replace(/^['"]|['"]$/g, '');
   const fbt = envText.match(/^\s*FB_ACCESS_TOKEN\s*=\s*(.+?)\s*$/m);
   if (fbt) FB_ACCESS_TOKEN = fbt[1].replace(/^['"]|['"]$/g, '');
+  const ttm = envText.match(/^\s*TT_COOKIES\s*=\s*(.+?)\s*$/m);
+  if (ttm) TT_COOKIES = ttm[1].replace(/^['"]|['"]$/g, '');
+  const ttu = envText.match(/^\s*TT_USERNAME\s*=\s*(.+?)\s*$/m);
+  if (ttu) ttLoggedUsername = ttu[1].replace(/^['"]|['"]$/g, '');
 } catch (_) { /* no .env file */ }
 if (IG_SESSIONID) {
   IG_DS_USER_ID = IG_SESSIONID.split('%3A')[0];
@@ -35,12 +49,20 @@ if (FB_COOKIES) {
   const cUserMatch = FB_COOKIES.match(/c_user=(\d+)/);
   if (cUserMatch) FB_USER_ID = cUserMatch[1];
 }
+if (TT_COOKIES) {
+  // TikTok's sessionid format doesn't embed a user id, but tt_chain_token
+  // and msToken are present in fully authenticated sessions. We just
+  // remember whatever username the validation endpoint returned.
+}
 console.log(IG_SESSIONID
   ? `[auth] IG sessionid loaded (user ${IG_DS_USER_ID}) — HD profile pics enabled`
   : '[auth] no IG sessionid configured — falling back to thumbnail scraping');
 console.log(FB_COOKIES
   ? `[auth] FB session loaded (user ${FB_USER_ID}, @${fbLoggedUsername})`
   : '[auth] no FB session configured');
+console.log(TT_COOKIES
+  ? `[auth] TT session loaded (@${ttLoggedUsername || 'unknown'})`
+  : '[auth] no TT session configured');
 
 function httpsGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -158,7 +180,7 @@ function parseOgDescription(desc) {
 app.get('/api/image-proxy', (req, res) => {
   const target = req.query.url;
   const name = req.query.name;
-  if (!target || !/^https:\/\/[^/]*(fbcdn\.net|cdninstagram\.com|tiktokcdn\.com|tiktokcdn-us\.com|ibyteimg\.com|tikwm\.com|vsco\.co)\//.test(target)) {
+  if (!target || !/^https:\/\/[^/]*(fbcdn\.net|cdninstagram\.com|tiktokcdn\.com|tiktokcdn-us\.com|ibyteimg\.com|tikwm\.com|vsco\.co|pbs\.twimg\.com|video\.twimg\.com|abs\.twimg\.com|ytimg\.com|googleusercontent\.com|sndcdn\.com|i\.redd\.it|preview\.redd\.it|external-preview\.redd\.it|i\.redditmedia\.com|styles\.redditmedia\.com)\//.test(target)) {
     return res.status(400).send('bad url');
   }
 
@@ -175,8 +197,16 @@ app.get('/api/image-proxy', (req, res) => {
     if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif';
     if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
         buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'image/webp';
-    // HEIC/HEIF: ftyp box at offset 4
-    if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return 'image/heic';
+    // ISO base media file format — both MP4 video and HEIC/HEIF images
+    // start with `ftyp` at offset 4. Disambiguate via the major brand at
+    // offset 8: HEIC variants vs everything else (treat as MP4-family).
+    if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) {
+      const brand = buf.slice(8, 12).toString('ascii');
+      if (/^(heic|heix|hevc|hevx|mif1|msf1|heim|heis|avif)$/i.test(brand)) {
+        return brand.toLowerCase() === 'avif' ? 'image/avif' : 'image/heic';
+      }
+      return 'video/mp4';
+    }
     return null;
   }
 
@@ -210,13 +240,25 @@ app.get('/api/image-proxy', (req, res) => {
     res.setHeader('Content-Length', buffer.length);
     res.setHeader('Cache-Control', 'public, max-age=3600');
     if (name) {
-      const safe = String(name).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
-      const ext = contentType.includes('webp') ? 'webp'
+      // Strip any media extension the caller passed so we don't end up
+      // with "foo.mp4.mp4" after appending the detected one below.
+      const safe = String(name)
+        .replace(/[^a-zA-Z0-9._-]/g, '_')
+        .replace(/\.(mp4|m4v|mov|webm|jpg|jpeg|png|gif|webp|heic|heif|avif)$/i, '')
+        .slice(0, 100);
+      const ext = contentType.startsWith('video/') ? 'mp4'
+                : contentType.includes('webp') ? 'webp'
                 : contentType.includes('png')  ? 'png'
                 : contentType.includes('gif')  ? 'gif'
+                : contentType.includes('avif') ? 'avif'
                 : contentType.includes('heic') ? 'heic'
                 : 'jpg';
-      res.setHeader('Content-Disposition', `inline; filename="${safe}.${ext}"`);
+      // `name=` means the client called this as a download URL — set
+      // attachment so the browser triggers a download from this single
+      // request. Without it, IDM-style download managers fire a parallel
+      // request while the browser also keeps trying, which causes the
+      // "file wasn't available" race.
+      res.setHeader('Content-Disposition', `attachment; filename="${safe}.${ext}"`);
     }
     res.end(buffer);
   }
@@ -347,7 +389,7 @@ app.get('/api/image-proxy', (req, res) => {
                     : contentType.includes('gif')  ? 'gif'
                     : contentType.includes('mp4')  ? 'mp4'
                     : 'jpg';
-          res.setHeader('Content-Disposition', `inline; filename="${safe}.${ext}"`);
+          res.setHeader('Content-Disposition', `attachment; filename="${safe}.${ext}"`);
         }
       };
 
@@ -387,7 +429,7 @@ app.get('/api/image-proxy', (req, res) => {
             res.setHeader('Content-Length', jpeg.length);
             res.setHeader('Cache-Control', 'public, max-age=3600');
             const safe = String(name).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
-            res.setHeader('Content-Disposition', `inline; filename="${safe}.jpg"`);
+            res.setHeader('Content-Disposition', `attachment; filename="${safe}.jpg"`);
             res.end(jpeg);
           } catch (e) {
             console.warn(`[image-proxy] webp→jpeg transcode failed: ${e.message}, sending original`);
@@ -787,6 +829,32 @@ async function checkIsPrivateWeb(username) {
   }
 }
 
+// IG's `video_versions` array is the authoritative quality list — each
+// entry has {url, width, height, type}. We sort by height desc, drop
+// duplicate heights (keeping the first occurrence, which is typically the
+// highest-bitrate variant per height), and return the same shape the
+// frontend uses for FB/YouTube quality pickers.
+function igVideoVersions(versions) {
+  if (!Array.isArray(versions) || !versions.length) return [];
+  const seen = new Set();
+  const out = versions
+    .filter(v => v && v.url)
+    .slice()
+    .sort((a, b) => (b.height || 0) - (a.height || 0))
+    .filter(v => {
+      const h = v.height || 0;
+      if (seen.has(h)) return false;
+      seen.add(h);
+      return true;
+    })
+    .map(v => ({ url: v.url, width: v.width || 0, height: v.height || 0 }));
+  if (out.length) {
+    const heights = out.map(v => v.height || '?').join(',');
+    console.log(`[ig-video-versions] ${out.length} variant(s): ${heights}`);
+  }
+  return out;
+}
+
 // ---------- Instagram Posts / Reels ----------
 app.get('/api/ig-posts/:username', async (req, res) => {
   const { username } = req.params;
@@ -897,8 +965,10 @@ async function fetchIgPostsAuthed(userId, maxId) {
 
       // Get video URL for reels/videos
       let videoUrl = null;
+      let videoVersions = [];
       if (isVideo && item.video_versions && item.video_versions.length) {
-        videoUrl = item.video_versions[0].url;
+        videoVersions = igVideoVersions(item.video_versions);
+        videoUrl = videoVersions[0]?.url || item.video_versions[0].url;
       }
 
       // Extract carousel media items
@@ -911,10 +981,17 @@ async function fetchIgPostsAuthed(userId, maxId) {
             cmThumb = cm.image_versions2.candidates[0].url;
           }
           let cmVideo = null;
+          let cmVideoVersions = [];
           if (cmIsVideo && cm.video_versions && cm.video_versions.length) {
-            cmVideo = cm.video_versions[0].url;
+            cmVideoVersions = igVideoVersions(cm.video_versions);
+            cmVideo = cmVideoVersions[0]?.url || cm.video_versions[0].url;
           }
-          return { type: cmIsVideo ? 'video' : 'image', url: cmThumb, videoUrl: cmVideo };
+          return {
+            type: cmIsVideo ? 'video' : 'image',
+            url: cmThumb,
+            videoUrl: cmVideo,
+            videoVersions: cmVideoVersions,
+          };
         });
       }
 
@@ -924,6 +1001,7 @@ async function fetchIgPostsAuthed(userId, maxId) {
         type: isReel ? 'reel' : isCarousel ? 'carousel' : isVideo ? 'video' : 'image',
         thumbnail,
         videoUrl,
+        videoVersions,
         carouselItems,
         likeCount: item.like_count || 0,
         commentCount: item.comment_count || 0,
@@ -954,6 +1032,7 @@ function parseIgPostsFromHtml(html) {
             type: node.is_video ? 'video' : 'image',
             thumbnail: node.thumbnail_src || node.display_url,
             videoUrl: node.video_url || null,
+            videoVersions: node.video_url ? [{ url: node.video_url, width: 0, height: 0 }] : [],
             likeCount: node.edge_liked_by?.count || 0,
             commentCount: node.edge_media_to_comment?.count || 0,
             caption: node.edge_media_to_caption?.edges?.[0]?.node?.text || '',
@@ -1017,14 +1096,17 @@ app.get('/api/ig-stories/:username', async (req, res) => {
         thumbnail = item.image_versions2.candidates[0].url;
       }
       let videoUrl = null;
+      let videoVersions = [];
       if (isVideo && item.video_versions && item.video_versions.length) {
-        videoUrl = item.video_versions[0].url;
+        videoVersions = igVideoVersions(item.video_versions);
+        videoUrl = videoVersions[0]?.url || item.video_versions[0].url;
       }
       return {
         id: item.pk || item.id,
         type: isVideo ? 'video' : 'image',
         thumbnail,
         videoUrl,
+        videoVersions,
         timestamp: item.taken_at,
         expiringAt: item.expiring_at,
       };
@@ -1138,14 +1220,17 @@ app.get('/api/ig-highlight/:highlightId', async (req, res) => {
         thumbnail = item.image_versions2.candidates[0].url;
       }
       let videoUrl = null;
+      let videoVersions = [];
       if (isVideo && item.video_versions && item.video_versions.length) {
-        videoUrl = item.video_versions[0].url;
+        videoVersions = igVideoVersions(item.video_versions);
+        videoUrl = videoVersions[0]?.url || item.video_versions[0].url;
       }
       return {
         id: item.pk || item.id,
         type: isVideo ? 'video' : 'image',
         thumbnail,
         videoUrl,
+        videoVersions,
         timestamp: item.taken_at,
       };
     });
@@ -1154,6 +1239,113 @@ app.get('/api/ig-highlight/:highlightId', async (req, res) => {
   } catch (err) {
     console.error('[ig-highlight]', err.message);
     res.status(500).json({ error: 'Failed to fetch highlight items.' });
+  }
+});
+
+// ---------- Instagram per-media full-quality versions ----------
+// IG's profile feed (`/feed/user/<id>/`) and even the mobile media-info
+// endpoint serve down-graded video_versions (reels capped at 720x1280).
+// The only reliable way to surface the original 1080x1920 stream — which
+// is what sealx and similar downloaders show — is to call yt-dlp with
+// our IG session cookies. yt-dlp goes through the same web-API path the
+// real instagram.com client uses, which exposes the full DASH manifest.
+//
+// Accepts the post's shortcode (e.g. DXT5zmfiHCQ); works for /reel/ and
+// /p/ URLs alike since yt-dlp normalizes both.
+
+// Writes a Netscape-format cookie file yt-dlp can consume. Re-written on
+// every call so a fresh login or logout is picked up immediately.
+function writeIgCookieFile() {
+  if (!IG_SESSIONID) return null;
+  const expiresAt = Math.floor(Date.now() / 1000) + 86400 * 365;
+  const lines = [
+    '# Netscape HTTP Cookie File',
+    `.instagram.com\tTRUE\t/\tTRUE\t${expiresAt}\tsessionid\t${IG_SESSIONID}`,
+  ];
+  if (IG_DS_USER_ID) {
+    lines.push(`.instagram.com\tTRUE\t/\tTRUE\t${expiresAt}\tds_user_id\t${IG_DS_USER_ID}`);
+  }
+  const file = path.join(os.tmpdir(), `yeti_ig_cookies_${process.pid}.txt`);
+  fs.writeFileSync(file, lines.join('\n') + '\n');
+  return file;
+}
+
+// Map yt-dlp's formats[] for an IG video into our {url,width,height} list,
+// dedup'd by height with the highest tbr per height kept.
+function igFormatsFromYtDlp(info) {
+  if (!info) return [];
+  const fmts = (info.formats || []).filter(f => f.url && f.vcodec && f.vcodec !== 'none' && f.height);
+  if (!fmts.length) {
+    return info.url && info.height
+      ? [{ url: info.url, width: info.width || 0, height: info.height || 0 }]
+      : [];
+  }
+  const byHeight = new Map();
+  for (const f of fmts) {
+    const tbr = Number(f.tbr) || 0;
+    const prev = byHeight.get(f.height);
+    if (!prev || tbr > (Number(prev.tbr) || 0)) byHeight.set(f.height, f);
+  }
+  return Array.from(byHeight.values())
+    .sort((a, b) => (b.height || 0) - (a.height || 0))
+    .map(f => ({ url: f.url, width: f.width || 0, height: f.height || 0 }));
+}
+
+app.get('/api/ig-post-versions/:code', async (req, res) => {
+  if (!IG_SESSIONID) {
+    return res.status(401).json({ error: 'Login required for high-quality variants.' });
+  }
+  const { code } = req.params;
+  if (!/^[A-Za-z0-9_-]{3,50}$/.test(code)) {
+    return res.status(400).json({ error: 'Invalid shortcode.' });
+  }
+  const cookieFile = writeIgCookieFile();
+  if (!cookieFile) {
+    return res.status(401).json({ error: 'Login required for high-quality variants.' });
+  }
+  // yt-dlp accepts both /reel/<code>/ and /p/<code>/, normalizing
+  // internally — `/p/` works for posts and reels alike.
+  const url = `https://www.instagram.com/p/${code}/`;
+  try {
+    const t0 = Date.now();
+    const ytArgs = [
+      '--dump-single-json',
+      '--no-warnings',
+      '--no-check-certificate',
+      '--no-playlist',
+      '--cookies', cookieFile,
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      url,
+    ];
+    const { stdout } = await ytExec(ytArgs);
+    const info = JSON.parse(stdout);
+    console.log(`[ig-post-versions] ${code} ok in ${Date.now() - t0}ms`);
+
+    // Carousel posts: yt-dlp emits a playlist with `entries[]`, one per
+    // slide. Single posts/reels just have `formats[]` directly.
+    if (Array.isArray(info.entries) && info.entries.length) {
+      const carousel = info.entries.map(e => ({ videoVersions: igFormatsFromYtDlp(e) }));
+      const top = carousel.find(c => c.videoVersions.length)?.videoVersions || [];
+      const heights = top.map(v => v.height).join(',');
+      console.log(`[ig-post-versions] carousel ${carousel.length} item(s), top heights: ${heights}`);
+      return res.json({ videoVersions: top, carousel });
+    }
+
+    const versions = igFormatsFromYtDlp(info);
+    const heights = versions.map(v => v.height).join(',');
+    console.log(`[ig-post-versions] heights: ${heights || '(none)'}`);
+    res.json({ videoVersions: versions, carousel: null });
+  } catch (err) {
+    const msg = (err.stderr || err.message || '').toString();
+    console.error('[ig-post-versions]', msg.slice(0, 400));
+    if (/login.required|requires login|login_required|session/i.test(msg)) {
+      invalidateIgSession('ig-post-versions login required');
+      return res.status(401).json({ error: 'Session expired.', loggedOut: true });
+    }
+    if (/private|not.found|removed|deleted|404/i.test(msg)) {
+      return res.status(404).json({ error: 'Post unavailable (private, removed, or deleted)' });
+    }
+    res.status(500).json({ error: 'Failed to fetch media info' });
   }
 });
 
@@ -1485,6 +1677,1247 @@ app.get('/api/vsco-post', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch post' });
+  }
+});
+
+// ---------- X / Twitter Tweet ----------
+// Two-tier extraction:
+//   1. cdn.syndication.twimg.com — the public embed-widget API (no auth).
+//      Fast and reliable for normal tweets but returns TweetTombstone for
+//      anything age-gated, sensitive, NSFW, or login-walled.
+//   2. api.fxtwitter.com — a community-maintained Twitter mirror used by
+//      Discord/Telegram embeds. Picks up most tombstoned tweets because
+//      it routes through different bot endpoints.
+function tweetToken(id) {
+  // Twitter's own embed JS: `((id / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '')`.
+  // Number() loses precision on 19-digit IDs, but the token is only used
+  // as a CDN cache key — Twitter doesn't validate the math, just that it
+  // hashes consistently per ID. The lossy result is stable.
+  return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+}
+
+// fxtwitter.com mirror — returns clean JSON for public tweets, including
+// many that the syndication API tombstones. Resolves to a normalized
+// `{ author, nickname, description, mediaDetails: [...] }` shape that
+// matches the syndication response so the same extraction logic works.
+async function fetchFxtwitter(id) {
+  return new Promise((resolve) => {
+    https.get({
+      host: 'api.fxtwitter.com',
+      path: `/i/status/${id}`,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+      },
+      rejectUnauthorized: false,
+    }, (res) => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(body);
+          if (!j || j.code !== 200 || !j.tweet) {
+            console.warn(`[x-tweet] fxtwitter ${id} status=${res.statusCode} code=${j && j.code} msg=${j && j.message}`);
+            return resolve(null);
+          }
+          const t = j.tweet;
+          // Map fxtwitter media → syndication-shaped mediaDetails entries
+          const allMedia = (t.media && t.media.all) || [];
+          const mediaDetails = allMedia.map(m => {
+            if (m.type === 'video' || m.type === 'gif') {
+              return {
+                type: m.type === 'gif' ? 'animated_gif' : 'video',
+                media_url_https: m.thumbnail_url || '',
+                original_info: { width: m.width || 0, height: m.height || 0 },
+                video_info: {
+                  duration_millis: m.duration ? Math.round(m.duration * 1000) : 0,
+                  // fxtwitter only exposes the chosen variant — emit it as the only mp4
+                  variants: [{ content_type: 'video/mp4', bitrate: m.bitrate || 0, url: m.url }],
+                },
+              };
+            }
+            return {
+              type: 'photo',
+              media_url_https: m.url || '',
+              original_info: { width: m.width || 0, height: m.height || 0 },
+            };
+          });
+          resolve({
+            __typename: 'Tweet',
+            user: { screen_name: t.author && t.author.screen_name, name: t.author && t.author.name },
+            text: t.text || '',
+            mediaDetails,
+          });
+        } catch (e) {
+          console.warn(`[x-tweet] fxtwitter ${id} parse: ${e.message}`);
+          resolve(null);
+        }
+      });
+    }).on('error', (e) => {
+      console.warn(`[x-tweet] fxtwitter ${id} err: ${e.message}`);
+      resolve(null);
+    });
+  });
+}
+
+// Follow t.co / shortener redirects until we land on a /status/<id> URL.
+async function resolveTweetUrl(url, hops = 0) {
+  if (hops > 5) return url;
+  if (/(?:twitter\.com|x\.com)\/[^/]+\/status\/(\d+)/i.test(url)) return url;
+  if (!/^https?:\/\/(t\.co|tinyurl\.com|bit\.ly)\//i.test(url)) return url;
+  const u = new URL(url);
+  return new Promise((resolve) => {
+    https.get({
+      host: u.host, path: u.pathname + u.search,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' },
+      rejectUnauthorized: false,
+    }, (res) => {
+      res.resume();
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        const next = res.headers.location.startsWith('http')
+                   ? res.headers.location
+                   : `https://${u.host}${res.headers.location}`;
+        return resolve(resolveTweetUrl(next, hops + 1));
+      }
+      resolve(url);
+    }).on('error', () => resolve(url));
+  });
+}
+
+app.get('/api/x-tweet', async (req, res) => {
+  const rawUrl = req.query.url;
+  if (!rawUrl || !/^https?:\/\//.test(rawUrl)) {
+    return res.status(400).json({ error: 'Please paste a valid X/Twitter URL' });
+  }
+  try {
+    const resolved = await resolveTweetUrl(rawUrl);
+    const idMatch = resolved.match(/(?:twitter\.com|x\.com)\/[^/]+\/status\/(\d+)/i);
+    if (!idMatch) return res.status(400).json({ error: 'Could not extract tweet ID from URL' });
+    const id = idMatch[1];
+    const token = tweetToken(id);
+
+    const r = await httpsGet(
+      `https://cdn.syndication.twimg.com/tweet-result?id=${id}&token=${encodeURIComponent(token)}&lang=en`,
+      {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Referer': 'https://platform.twitter.com/',
+      }
+    );
+    if (r.status === 404) return res.status(404).json({ error: 'Tweet not found, deleted, or private' });
+    if (r.status !== 200) return res.status(r.status).json({ error: `Twitter returned ${r.status}` });
+
+    let j;
+    try { j = JSON.parse(r.body); } catch (_) {
+      console.warn(`[x-tweet] ${id} non-JSON body[0..200]: ${r.body.slice(0,200)}`);
+      j = null;
+    }
+    // Syndication tombstones age-gated/sensitive tweets — fall through to
+    // fxtwitter which routes via different (bot-friendly) endpoints.
+    if (!j || j.tombstone || j.__typename !== 'Tweet') {
+      console.log(`[x-tweet] ${id} syndication=${j && j.__typename || 'none'} → trying fxtwitter`);
+      const fx = await fetchFxtwitter(id);
+      if (fx) {
+        console.log(`[x-tweet] ${id} fxtwitter ok (mediaCount=${fx.mediaDetails.length})`);
+        j = fx;
+      } else {
+        return res.status(404).json({ error: 'Tweet unavailable (deleted, age-restricted, or private)' });
+      }
+    } else {
+      console.log(`[x-tweet] ${id} syndication ok (mediaCount=${(j.mediaDetails || []).length})`);
+    }
+
+    const user = j.user || {};
+    const author = user.screen_name || '';
+    const nickname = user.name || '';
+    const description = j.text || '';
+    const media = (j.mediaDetails && j.mediaDetails[0]) || null;
+
+    if (!media) {
+      return res.status(404).json({ error: 'Tweet has no downloadable media' });
+    }
+
+    const origInfo = media.original_info || {};
+    let downloadUrl = '';
+    let mediaType = 'photo';
+    let cover = media.media_url_https || '';
+    let bitrate = 0;
+    let duration = 0;
+    let sizeBytes = 0;
+
+    if (media.type === 'video' || media.type === 'animated_gif') {
+      mediaType = 'video';
+      const variants = (media.video_info && media.video_info.variants) || [];
+      let best = null;
+      for (const v of variants) {
+        if (v.content_type !== 'video/mp4') continue;
+        // Always seed `best` on the first mp4, then prefer higher bitrates.
+        // Bare `>` skipped fxtwitter's single-variant case where bitrate is 0/undefined.
+        if (!best || (v.bitrate || 0) > (best.bitrate || 0)) best = v;
+      }
+      if (!best) return res.status(404).json({ error: 'No mp4 variant available' });
+      downloadUrl = best.url;
+      bitrate = best.bitrate || 0;
+      duration = (media.video_info && media.video_info.duration_millis)
+        ? Math.round(media.video_info.duration_millis / 1000) : 0;
+      // HEAD-follow to get exact size
+      const head = await httpHead(downloadUrl, {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://twitter.com/',
+      });
+      sizeBytes = head.size || 0;
+    } else {
+      // Photo — `?name=orig` returns the un-resized original. Twitter strips
+      // EXIF but otherwise leaves it alone (no re-encode, no watermark).
+      mediaType = 'photo';
+      const base = media.media_url_https || '';
+      downloadUrl = base.includes('?') ? base : base + '?name=orig';
+    }
+
+    res.json({
+      id,
+      author,
+      nickname,
+      description,
+      cover,
+      mediaType,
+      downloadUrl,
+      width: origInfo.width || 0,
+      height: origInfo.height || 0,
+      bitrate,
+      duration,
+      sizeBytes,
+      mediaCount: (j.mediaDetails || []).length,
+    });
+  } catch (err) {
+    console.error('[x-tweet]', err);
+    res.status(500).json({ error: 'Failed to fetch tweet' });
+  }
+});
+
+// ---------- YouTube ----------
+// Uses yt-dlp (via the `youtube-dl-exec` wrapper that bundles the binary at
+// install time) to extract the full format list, plus `ffmpeg-static` to
+// mux DASH (audio + video as separate streams) into a single mp4 on demand.
+// Both are npm deps — no system installation required.
+//
+// We invoke yt-dlp via raw `spawn` rather than the wrapper's API: the wrapper
+// uses `shell: true` and doesn't quote args, so paths containing spaces (e.g.
+// "YETI Downloader\...\ffmpeg.exe") get word-split and yt-dlp sees fragments
+// as separate URL args. spawn() without shell passes each arg verbatim.
+const YT_URL_RE = /^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\//i;
+
+// Accept bare URLs without a protocol (e.g. paste of "youtube.com/watch?v=...").
+// Returns the normalized URL or null if it isn't a YouTube URL at all.
+function normalizeYtUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (YT_URL_RE.test(s)) return s;
+  if (/^(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\//i.test(s)) return 'https://' + s;
+  return null;
+}
+const YT_BASE_ARGS = [
+  '--no-warnings',
+  '--no-check-certificate',
+  '--ffmpeg-location', ffmpegPath,
+  // yt-dlp recently started requiring a JS runtime for full YouTube format
+  // extraction. We already have Node running the server, so reuse it.
+  '--js-runtimes', `node:${process.execPath}`,
+  // Strip ?list= / radio playlists from the URL — without this, a "watch
+  // with autoplay/radio" link causes yt-dlp to enumerate the whole queue
+  // (often hundreds of items) before returning, which blows past any
+  // reasonable timeout. We always want the single video.
+  '--no-playlist',
+];
+
+function ytExec(args, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ytdlpPath, args, { windowsHide: true });
+    let stdout = '', stderr = '';
+    let timer = setTimeout(() => {
+      console.warn(`[yt-info] timed out after ${timeoutMs}ms — killing yt-dlp`);
+      proc.kill('SIGKILL');
+    }, timeoutMs);
+    proc.stdout.on('data', d => { stdout += d; });
+    proc.stderr.on('data', d => { stderr += d; });
+    proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        const err = new Error(`yt-dlp exited ${code}`);
+        err.stderr = stderr;
+        return reject(err);
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+app.get('/api/yt-info', async (req, res) => {
+  const url = normalizeYtUrl(req.query.url);
+  if (!url) {
+    return res.status(400).json({ error: 'Please paste a valid YouTube URL' });
+  }
+  try {
+    const t0 = Date.now();
+    console.log(`[yt-info] start: ${url}`);
+    const { stdout, stderr } = await ytExec([
+      '--dump-single-json',
+      '--prefer-free-formats',
+      ...YT_BASE_ARGS,
+      url,
+    ]);
+    console.log(`[yt-info] yt-dlp ok in ${Date.now() - t0}ms (stdout=${stdout.length}b, stderr=${stderr.length}b)`);
+    const info = JSON.parse(stdout);
+
+    // Bucket formats by display height and pick the best one per bucket.
+    // Score order: mp4 > webm (consistent muxed output), formats with a
+    // known filesize > formats without (so the UI always has a real number
+    // when one's available), then highest tbr wins ties. We skip HLS
+    // (m3u8) variants — yt-dlp reports `tbr` for HLS as the manifest's
+    // peak bitrate, but the actual encoded segments are often half that,
+    // so any size estimate is wildly off and the muxed mp4 would be
+    // smaller than the declared Content-Length. DASH formats have exact
+    // filesizes from the CDN so the estimate is reliable within a few KB.
+    const buckets = new Map();
+    const knownSize = (f) => Number(f.filesize) || Number(f.filesize_approx) || 0;
+    const isHls = (f) => /m3u8/i.test(f.protocol || '');
+    const score = (f) =>
+      (f.ext === 'mp4' ? 1000 : 0) +
+      (knownSize(f) > 0 ? 500 : 0) +
+      (Number(f.tbr) || 0);
+    for (const f of info.formats || []) {
+      if (!f.vcodec || f.vcodec === 'none') continue; // skip audio-only
+      if (!f.height) continue;
+      if (isHls(f)) continue; // skip HLS — bitrate-only size, padding breaks mp4
+      const fpsKey = f.fps && f.fps > 30 ? f.fps : 30;
+      const key = `${f.height}_${fpsKey}`;
+      const prev = buckets.get(key);
+      if (!prev || score(f) > score(prev)) buckets.set(key, f);
+    }
+    // Pick the audio format yt-dlp will pair with our chosen video for
+    // mp4 mux (m4a/aac is preferred so the muxed mp4 doesn't need codec
+    // re-encoding). Falls back to highest-bitrate audio if m4a missing.
+    const audioFormats = (info.formats || []).filter(f => (f.acodec && f.acodec !== 'none') && (!f.vcodec || f.vcodec === 'none'));
+    const audioFmt =
+      audioFormats.find(f => f.format_id === '140') ||
+      audioFormats.find(f => f.ext === 'm4a') ||
+      audioFormats.sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
+    const duration = Number(info.duration) || 0;
+    const audioBytes = audioFmt
+      ? (Number(audioFmt.filesize) || Number(audioFmt.filesize_approx) || Math.round(((Number(audioFmt.abr) || 128) * 1000 / 8) * duration))
+      : Math.round(128 * 1000 / 8 * duration); // 128 kbps default
+    // For variants without a declared filesize (HLS, livestreams), estimate
+    // from total bitrate × duration. We use this size both for the UI and as
+    // the Content-Length the streaming endpoint will declare to download
+    // managers — so the IDM dialog can show a real number instantly without
+    // waiting for muxing. Server pads/truncates to match this byte count.
+    // Add ~256 KB pad to cover ffmpeg muxing overhead (mp4 container metadata).
+    const MUX_OVERHEAD = 256 * 1024;
+    const qualities = [...buckets.values()]
+      .sort((a, b) => (b.height - a.height) || ((b.fps || 0) - (a.fps || 0)))
+      .map(f => {
+        const hasAudio = f.acodec && f.acodec !== 'none';
+        const declaredV = knownSize(f);
+        const tbr = Number(f.tbr) || 0; // kbps
+        const estimatedV = duration && tbr ? Math.round(tbr * 1000 / 8 * duration) : 0;
+        const videoBytes = declaredV || estimatedV;
+        // For DASH (no audio) we'll mux with the chosen audio track.
+        // For progressive (already has audio) the size is already complete.
+        const sizeBytes = hasAudio ? videoBytes : videoBytes + audioBytes + MUX_OVERHEAD;
+        return {
+          itag: String(f.format_id),
+          label: `${f.height}p${f.fps && f.fps > 30 ? f.fps : ''}`,
+          height: f.height,
+          fps: f.fps || 30,
+          ext: f.ext || 'mp4',
+          codec: f.vcodec || '',
+          sizeBytes,
+          sizeApprox: !declaredV,
+          bitrate: Math.round(tbr * 1000),
+          needsMux: !hasAudio,
+        };
+      });
+
+    if (qualities.length === 0) {
+      return res.status(404).json({ error: 'No downloadable video streams found' });
+    }
+
+    res.json({
+      id: info.id,
+      title: info.title || '',
+      author: info.uploader || info.channel || '',
+      channel: info.channel || info.uploader || '',
+      description: (info.description || '').slice(0, 300),
+      cover: info.thumbnail || '',
+      duration: info.duration || 0,
+      qualities,
+    });
+  } catch (err) {
+    const msg = (err.stderr || err.message || '').toString();
+    console.error('[yt-info]', msg.slice(0, 400));
+    if (/private|unavailable|removed|members.only|sign in/i.test(msg)) {
+      return res.status(404).json({ error: 'Video unavailable (private, removed, or sign-in required)' });
+    }
+    res.status(500).json({ error: 'Failed to fetch video info' });
+  }
+});
+
+// Mux to a temp file first, then serve via res.sendFile. Express then
+// handles Content-Length, Accept-Ranges, conditional GET — IDM gets exact
+// size, multi-connection parallel chunks, and pause/resume. The trade-off
+// is a "preparing" delay while yt-dlp downloads sources + ffmpeg muxes;
+// the frontend polls /api/yt-prepare-status to show a progress indicator
+// so the user knows it's working rather than staring at a blank screen.
+//
+// Earlier versions tried streaming-with-padding to skip the wait, but
+// trailing-zero pad after the mdat box corrupts non-faststart mp4 files
+// (where moov sits at EOF), and the writeStream/read race produced
+// truncated downloads. Pre-muxing is the only correct approach short of
+// caching pre-rendered files at a CDN like the big extractor sites do.
+const ytMuxCache = new Map(); // key → MuxEntry
+const YT_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function startMux(url, itag, entry) {
+  const tempPath = path.join(
+    os.tmpdir(),
+    `yeti_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`,
+  );
+  const args = [
+    '-f', `${itag}+bestaudio[ext=m4a]/${itag}+bestaudio/${itag}/best`,
+    '--merge-output-format', 'mp4',
+    '-o', tempPath,
+    '--newline',     // one progress line per update — keeps regex stable
+    '--progress',
+    ...YT_BASE_ARGS,
+    url,
+  ];
+  const proc = spawn(ytdlpPath || 'yt-dlp', args, { windowsHide: true });
+  entry.proc = proc;
+
+  let stderrBuf = '';
+  proc.stderr.on('data', (d) => { stderrBuf += d.toString(); });
+  // yt-dlp prints lines like "[download]  47.3% of 80.91MiB at 12.34MiB/s"
+  // with --progress. Track the percent for the frontend status poll.
+  proc.stdout.on('data', (chunk) => {
+    const m = chunk.toString().match(/(\d+(?:\.\d+)?)%/g);
+    if (m && m.length) {
+      const last = m[m.length - 1];
+      entry.percent = Math.min(100, Number(last.slice(0, -1)));
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    proc.on('error', (err) => reject(err));
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        fs.unlink(tempPath, () => {});
+        const err = new Error(`yt-dlp exited ${code}`);
+        err.stderr = stderrBuf;
+        return reject(err);
+      }
+      entry.percent = 100;
+      entry.file = tempPath;
+      resolve(tempPath);
+    });
+  });
+}
+
+function getMuxEntry(url, itag) {
+  const key = `${url}|${itag}`;
+  let entry = ytMuxCache.get(key);
+  if (entry) {
+    entry.lastAccess = Date.now();
+    return entry;
+  }
+  entry = {
+    url, itag, file: null, error: null, proc: null,
+    percent: 0,
+    lastAccess: Date.now(),
+    promise: null,
+  };
+  ytMuxCache.set(key, entry);
+  entry.promise = startMux(url, itag, entry).catch((err) => {
+    entry.error = err;
+    ytMuxCache.delete(key);
+    throw err;
+  });
+  return entry;
+}
+
+// Periodic cleanup of idle entries
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of ytMuxCache) {
+    if (now - entry.lastAccess > YT_CACHE_TTL_MS) {
+      ytMuxCache.delete(key);
+      if (entry.proc && !entry.proc.killed) entry.proc.kill('SIGKILL');
+      if (entry.file) fs.unlink(entry.file, () => {});
+    }
+  }
+}, 60 * 1000).unref();
+
+// Builds a Content-Disposition value that preserves the original filename
+// (including Unicode, spaces, etc.) via RFC 5987 while also providing an
+// ASCII fallback for legacy clients. Modern browsers and IDM read the
+// filename* form preferentially.
+function contentDispoAttachment(name, ext) {
+  const raw = String(name || `download_${Date.now()}`);
+  const ascii = raw.replace(/[^\x20-\x7e]/g, '_').replace(/[<>:"/\\|?*]/g, '_').slice(0, 100);
+  const encoded = encodeURIComponent(raw).replace(/['()]/g, escape).replace(/\*/g, '%2A');
+  return `attachment; filename="${ascii}.${ext}"; filename*=UTF-8''${encoded}.${ext}`;
+}
+
+// Frontend polls this endpoint while showing the "Preparing..." indicator.
+// Returns { percent, ready, error }. Triggers the mux on first call so the
+// server starts working before the user clicks the actual download button.
+app.get('/api/yt-prepare-status', (req, res) => {
+  const url = normalizeYtUrl(req.query.url);
+  const itag = req.query.itag;
+  if (!url || !itag) return res.status(400).json({ error: 'bad request' });
+  const entry = getMuxEntry(url, itag);
+  res.json({
+    percent: entry.percent,
+    ready: !!entry.file,
+    error: entry.error ? String(entry.error.message || entry.error) : null,
+  });
+});
+
+// Serves the muxed file once it's ready. If a request arrives before mux
+// completes, awaits the promise. res.sendFile handles Content-Length,
+// Accept-Ranges, conditional GET — full IDM/Range support automatically.
+app.get('/api/yt-stream', async (req, res) => {
+  const url = normalizeYtUrl(req.query.url);
+  const itag = req.query.itag;
+  const name = req.query.name;
+  if (!url || !itag) {
+    return res.status(400).end();
+  }
+  const dispo = contentDispoAttachment(name, 'mp4');
+  const entry = getMuxEntry(url, itag);
+  entry.lastAccess = Date.now();
+
+  try {
+    const filePath = await entry.promise;
+    entry.lastAccess = Date.now();
+    res.sendFile(filePath, {
+      headers: {
+        'Content-Type': 'video/mp4',
+        'Content-Disposition': dispo,
+      },
+    }, (err) => {
+      if (err && !res.headersSent) res.status(500).end();
+    });
+  } catch (err) {
+    console.warn(`[yt-stream] ${err.message}: ${(err.stderr || '').slice(0, 300)}`);
+    if (!res.headersSent) res.status(500).end();
+  }
+});
+
+// ---------- Facebook Video ----------
+// Same yt-dlp + ffmpeg mux pipeline as YouTube / Reddit. Handles every
+// FB video URL variant — /videos/, /watch/?v=, /reel/, fb.watch short
+// links, m.facebook.com mobile pages. yt-dlp's Facebook extractor
+// resolves the dash_prefetched_representations from the page JSON to
+// pick the highest-bitrate stream.
+const FB_VIDEO_URL_RE = /^https?:\/\/((www\.|m\.|web\.|mbasic\.)?facebook\.com|fb\.watch)\//i;
+
+function normalizeFbVideoUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (FB_VIDEO_URL_RE.test(s)) return s;
+  if (/^((www\.|m\.|web\.|mbasic\.)?facebook\.com|fb\.watch)\//i.test(s)) return 'https://' + s;
+  return null;
+}
+
+// /share/r/<id>/ and /share/v/<id>/ are FB share redirector URLs. yt-dlp's
+// FacebookReel / FacebookIE extractors don't always follow them, so we
+// resolve them here by scraping the canonical reel/video id from the
+// rendered HTML and rewriting to /reel/<id>/ or /watch?v=<id>.
+async function resolveFbShareUrl(url) {
+  if (!/\/share\/[a-z]\//i.test(url)) return url;
+  try {
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'en-US,en;q=0.9',
+    };
+    if (FB_COOKIES) headers['Cookie'] = FB_COOKIES;
+    const r = await httpsGet(url, headers);
+    const body = r.body || '';
+    const isReel = /\/share\/r\//i.test(url);
+    const m = body.match(/"video_id"\s*:\s*"(\d{8,})"/)
+          || body.match(/\/reel\/(\d{8,})/i)
+          || body.match(/\/videos\/(\d{8,})/i)
+          || body.match(/\/watch\/?\?v=(\d{8,})/i)
+          || body.match(/<meta\s+property="al:android:url"\s+content="fb:\/\/[^"]*?(\d{8,})/i);
+    if (m) {
+      const id = m[1];
+      const resolved = isReel
+        ? `https://www.facebook.com/reel/${id}/`
+        : `https://www.facebook.com/watch/?v=${id}`;
+      console.log(`[fb-share] ${url} -> ${resolved}`);
+      return resolved;
+    }
+    console.warn(`[fb-share] could not resolve ${url} — passing through to yt-dlp`);
+  } catch (err) {
+    console.warn(`[fb-share] resolve failed for ${url}: ${err.message}`);
+  }
+  return url;
+}
+
+// A real-browser User-Agent + Accept-Language is what nudges Facebook to
+// serve the full DASH manifest (HD/FHD video formats). With yt-dlp's
+// default UA, FB often only returns the SD progressive .mp4.
+const FB_BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+function fbCommonArgs() {
+  const args = [
+    '--user-agent', FB_BROWSER_UA,
+    '--add-header', 'Accept-Language: en-US,en;q=0.9',
+    '--no-warnings',
+    '--no-check-certificate',
+    '--no-playlist',
+  ];
+  if (FB_COOKIES) args.push('--add-header', `Cookie: ${FB_COOKIES}`);
+  return args;
+}
+
+app.get('/api/fb-video-info', async (req, res) => {
+  const raw = normalizeFbVideoUrl(req.query.url);
+  if (!raw) {
+    return res.status(400).json({ error: 'Please paste a valid Facebook video URL' });
+  }
+  const url = await resolveFbShareUrl(raw);
+  try {
+    const t0 = Date.now();
+    console.log(`[fb-video-info] start: ${url}`);
+    const ytArgs = ['--dump-single-json', ...fbCommonArgs(), url];
+    const { stdout } = await ytExec(ytArgs);
+    console.log(`[fb-video-info] yt-dlp ok in ${Date.now() - t0}ms`);
+    const info = JSON.parse(stdout);
+
+    const videoFmts = (info.formats || []).filter(f => f.vcodec && f.vcodec !== 'none' && f.height);
+    const audioFmts = (info.formats || []).filter(f =>
+      (!f.vcodec || f.vcodec === 'none') && f.acodec && f.acodec !== 'none'
+    );
+    const bestAudio = audioFmts.sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
+    const duration = Number(info.duration) || 0;
+
+    const knownSize = (f) => Number(f.filesize) || Number(f.filesize_approx) || 0;
+    const estFromTbr = (f, kind) => {
+      const r = kind === 'audio' ? Number(f.abr) || 128 : Number(f.tbr) || 0;
+      return duration && r ? Math.round(r * 1000 / 8 * duration) : 0;
+    };
+
+    // Build a dedup'd quality list — one entry per height, keeping the
+    // highest-bitrate format at each rung. This is what the frontend
+    // renders as quality buttons (matches the YouTube picker UX).
+    const byHeight = new Map();
+    for (const f of videoFmts) {
+      const h = f.height;
+      const tbr = Number(f.tbr) || 0;
+      const prev = byHeight.get(h);
+      if (!prev || tbr > (Number(prev.tbr) || 0)) byHeight.set(h, f);
+    }
+    const sortedFmts = Array.from(byHeight.values()).sort((a, b) => (b.height || 0) - (a.height || 0));
+    if (!sortedFmts.length) {
+      return res.status(404).json({ error: 'No video found at this URL' });
+    }
+
+    const audioInline = (f) => f.acodec && f.acodec !== 'none';
+    const qualities = sortedFmts.map(f => {
+      const known = knownSize(f);
+      const est = known || estFromTbr(f, 'video');
+      const audioBytes = audioInline(f)
+        ? 0
+        : (bestAudio ? (knownSize(bestAudio) || estFromTbr(bestAudio, 'audio')) : 0);
+      const sizeBytes = est + audioBytes + (audioBytes > 0 ? 200 * 1024 : 0);
+      return {
+        formatId: f.format_id,
+        label: `${f.height}p${f.fps && f.fps > 30 ? Math.round(f.fps) : ''}`,
+        height: f.height,
+        fps: f.fps || 0,
+        tbr: Number(f.tbr) || 0,
+        sizeBytes,
+        sizeApprox: !known,
+      };
+    });
+
+    const top = sortedFmts[0];
+    res.json({
+      id: info.id,
+      title: info.title || info.uploader || '',
+      author: info.uploader || info.creator || '',
+      description: (info.description || '').slice(0, 300),
+      cover: info.thumbnail || '',
+      duration,
+      width: top.width || 0,
+      height: top.height || 0,
+      sizeBytes: qualities[0].sizeBytes,
+      qualities,
+    });
+  } catch (err) {
+    const msg = (err.stderr || err.message || '').toString();
+    console.error('[fb-video-info]', msg.slice(0, 400));
+    if (/login.required|requires login|login_required|cookies/i.test(msg)) {
+      return res.status(401).json({ error: 'This video requires login. Log in with Facebook in the sidebar first.' });
+    }
+    if (/not.found|removed|deleted|private|410|404/i.test(msg)) {
+      return res.status(404).json({ error: 'Video unavailable (removed, private, or deleted)' });
+    }
+    if (/no video|unsupported url/i.test(msg)) {
+      return res.status(404).json({ error: 'No downloadable video at this URL' });
+    }
+    res.status(500).json({ error: 'Failed to fetch video info' });
+  }
+});
+
+const fbMuxCache = new Map();
+const FB_CACHE_TTL_MS = 10 * 60 * 1000;
+const fbCacheKey = (url, formatId) => `${formatId || 'best'}|${url}`;
+
+function startFbMux(url, formatId, entry) {
+  const tempPath = path.join(
+    os.tmpdir(),
+    `yeti_fb_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`,
+  );
+  // If a specific video format was chosen, pair it with the best audio
+  // stream and let ffmpeg mux. Otherwise let yt-dlp pick the absolute
+  // best video+audio combo.
+  const formatSpec = formatId
+    ? `${formatId}+bestaudio/${formatId}`
+    : 'bestvideo*+bestaudio/best';
+  const args = [
+    '-f', formatSpec,
+    '--merge-output-format', 'mp4',
+    '-o', tempPath,
+    '--newline',
+    '--progress',
+    ...fbCommonArgs(),
+    '--ffmpeg-location', ffmpegPath,
+    url,
+  ];
+  const proc = spawn(ytdlpPath || 'yt-dlp', args, { windowsHide: true });
+  entry.proc = proc;
+
+  let stderrBuf = '';
+  proc.stderr.on('data', (d) => { stderrBuf += d.toString(); });
+  proc.stdout.on('data', (chunk) => {
+    const m = chunk.toString().match(/(\d+(?:\.\d+)?)%/g);
+    if (m && m.length) {
+      const last = m[m.length - 1];
+      entry.percent = Math.min(100, Number(last.slice(0, -1)));
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    proc.on('error', (err) => reject(err));
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        fs.unlink(tempPath, () => {});
+        const err = new Error(`yt-dlp exited ${code}`);
+        err.stderr = stderrBuf;
+        return reject(err);
+      }
+      entry.percent = 100;
+      entry.file = tempPath;
+      resolve(tempPath);
+    });
+  });
+}
+
+function getFbEntry(url, formatId) {
+  const key = fbCacheKey(url, formatId);
+  let entry = fbMuxCache.get(key);
+  if (entry) {
+    entry.lastAccess = Date.now();
+    return entry;
+  }
+  entry = {
+    url, formatId, file: null, error: null, proc: null,
+    percent: 0,
+    lastAccess: Date.now(),
+    promise: null,
+  };
+  fbMuxCache.set(key, entry);
+  entry.promise = startFbMux(url, formatId, entry).catch((err) => {
+    entry.error = err;
+    fbMuxCache.delete(key);
+    throw err;
+  });
+  return entry;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of fbMuxCache) {
+    if (now - entry.lastAccess > FB_CACHE_TTL_MS) {
+      fbMuxCache.delete(key);
+      if (entry.proc && !entry.proc.killed) entry.proc.kill('SIGKILL');
+      if (entry.file) fs.unlink(entry.file, () => {});
+    }
+  }
+}, 60 * 1000).unref();
+
+app.get('/api/fb-video-prepare-status', async (req, res) => {
+  const raw = normalizeFbVideoUrl(req.query.url);
+  if (!raw) return res.status(400).json({ error: 'bad request' });
+  const url = await resolveFbShareUrl(raw);
+  const formatId = req.query.formatId || '';
+  const entry = getFbEntry(url, formatId);
+  res.json({
+    percent: entry.percent,
+    ready: !!entry.file,
+    error: entry.error ? String(entry.error.message || entry.error) : null,
+  });
+});
+
+app.get('/api/fb-video-stream', async (req, res) => {
+  const raw = normalizeFbVideoUrl(req.query.url);
+  const name = req.query.name;
+  const formatId = req.query.formatId || '';
+  if (!raw) {
+    return res.status(400).end();
+  }
+  const url = await resolveFbShareUrl(raw);
+  const dispo = contentDispoAttachment(name, 'mp4');
+  const entry = getFbEntry(url, formatId);
+  entry.lastAccess = Date.now();
+
+  try {
+    const filePath = await entry.promise;
+    entry.lastAccess = Date.now();
+    res.sendFile(filePath, {
+      headers: {
+        'Content-Type': 'video/mp4',
+        'Content-Disposition': dispo,
+      },
+    }, (err) => {
+      if (err && !res.headersSent) res.status(500).end();
+    });
+  } catch (err) {
+    console.warn(`[fb-video-stream] ${err.message}: ${(err.stderr || '').slice(0, 300)}`);
+    if (!res.headersSent) res.status(500).end();
+  }
+});
+
+// ---------- Reddit ----------
+// v.redd.it videos serve audio and video as separate DASH streams, so
+// downloading them requires the same yt-dlp + ffmpeg mux pattern as
+// YouTube. Frontend polls /api/rd-prepare-status while we mux to a temp
+// file, then triggers the download once it's ready (exact Content-Length,
+// Range support, IDM-friendly).
+const RD_URL_RE = /^https?:\/\/((www\.|old\.|new\.|np\.|m\.)?reddit\.com|redd\.it|v\.redd\.it)\//i;
+
+function normalizeRdUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (RD_URL_RE.test(s)) return s;
+  if (/^((www\.|old\.|new\.|np\.|m\.)?reddit\.com|redd\.it|v\.redd\.it)\//i.test(s)) return 'https://' + s;
+  return null;
+}
+
+app.get('/api/rd-info', async (req, res) => {
+  const url = normalizeRdUrl(req.query.url);
+  if (!url) {
+    return res.status(400).json({ error: 'Please paste a valid Reddit URL' });
+  }
+  try {
+    const t0 = Date.now();
+    console.log(`[rd-info] start: ${url}`);
+    const { stdout } = await ytExec([
+      '--dump-single-json',
+      '--no-warnings',
+      '--no-check-certificate',
+      '--no-playlist',
+      url,
+    ]);
+    console.log(`[rd-info] yt-dlp ok in ${Date.now() - t0}ms`);
+    const info = JSON.parse(stdout);
+
+    // Pick best video + best audio for size estimate. Reddit usually
+    // exposes a few DASH heights (240p / 480p / 720p / 1080p depending
+    // on uploader) plus a separate audio stream.
+    const videoFmts = (info.formats || []).filter(f => f.vcodec && f.vcodec !== 'none' && f.height);
+    const bestVideo = videoFmts.sort((a, b) =>
+      (b.height || 0) - (a.height || 0) || (Number(b.tbr) || 0) - (Number(a.tbr) || 0)
+    )[0];
+    const audioFmts = (info.formats || []).filter(f =>
+      (!f.vcodec || f.vcodec === 'none') && f.acodec && f.acodec !== 'none'
+    );
+    const bestAudio = audioFmts.sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0];
+    const duration = Number(info.duration) || 0;
+
+    const knownSize = (f) => Number(f.filesize) || Number(f.filesize_approx) || 0;
+    const estFromTbr = (f, kind) => {
+      const r = kind === 'audio' ? Number(f.abr) || 128 : Number(f.tbr) || 0;
+      return duration && r ? Math.round(r * 1000 / 8 * duration) : 0;
+    };
+    const videoBytes = bestVideo ? (knownSize(bestVideo) || estFromTbr(bestVideo, 'video')) : 0;
+    const hasAudioInline = bestVideo && bestVideo.acodec && bestVideo.acodec !== 'none';
+    const audioBytes = hasAudioInline ? 0 : (bestAudio ? (knownSize(bestAudio) || estFromTbr(bestAudio, 'audio')) : 0);
+    const MUX_OVERHEAD = 200 * 1024; // mp4 box headers
+    const sizeBytes = videoBytes + audioBytes + (audioBytes > 0 ? MUX_OVERHEAD : 0);
+
+    if (!bestVideo) {
+      return res.status(404).json({ error: 'No video found in this Reddit post' });
+    }
+
+    res.json({
+      id: info.id,
+      title: info.title || '',
+      author: info.uploader || info.creator || '',
+      description: (info.description || '').slice(0, 300),
+      cover: info.thumbnail || '',
+      duration,
+      width: bestVideo.width || 0,
+      height: bestVideo.height || 0,
+      sizeBytes,
+    });
+  } catch (err) {
+    const msg = (err.stderr || err.message || '').toString();
+    console.error('[rd-info]', msg.slice(0, 400));
+    if (/not.found|removed|deleted|private|410/i.test(msg)) {
+      return res.status(404).json({ error: 'Post unavailable (removed, private, or deleted)' });
+    }
+    if (/no video|unsupported url/i.test(msg)) {
+      return res.status(404).json({ error: 'No downloadable video in this post (text/image-only posts not supported yet)' });
+    }
+    res.status(500).json({ error: 'Failed to fetch post info' });
+  }
+});
+
+const rdMuxCache = new Map();
+const RD_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function startRdMux(url, entry) {
+  const tempPath = path.join(
+    os.tmpdir(),
+    `yeti_rd_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp4`,
+  );
+  const args = [
+    '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+    '--merge-output-format', 'mp4',
+    '-o', tempPath,
+    '--newline',
+    '--progress',
+    '--no-playlist',
+    '--no-warnings',
+    '--no-check-certificate',
+    '--ffmpeg-location', ffmpegPath,
+    url,
+  ];
+  const proc = spawn(ytdlpPath || 'yt-dlp', args, { windowsHide: true });
+  entry.proc = proc;
+
+  let stderrBuf = '';
+  proc.stderr.on('data', (d) => { stderrBuf += d.toString(); });
+  proc.stdout.on('data', (chunk) => {
+    const m = chunk.toString().match(/(\d+(?:\.\d+)?)%/g);
+    if (m && m.length) {
+      const last = m[m.length - 1];
+      entry.percent = Math.min(100, Number(last.slice(0, -1)));
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    proc.on('error', (err) => reject(err));
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        fs.unlink(tempPath, () => {});
+        const err = new Error(`yt-dlp exited ${code}`);
+        err.stderr = stderrBuf;
+        return reject(err);
+      }
+      entry.percent = 100;
+      entry.file = tempPath;
+      resolve(tempPath);
+    });
+  });
+}
+
+function getRdEntry(url) {
+  let entry = rdMuxCache.get(url);
+  if (entry) {
+    entry.lastAccess = Date.now();
+    return entry;
+  }
+  entry = {
+    url, file: null, error: null, proc: null,
+    percent: 0,
+    lastAccess: Date.now(),
+    promise: null,
+  };
+  rdMuxCache.set(url, entry);
+  entry.promise = startRdMux(url, entry).catch((err) => {
+    entry.error = err;
+    rdMuxCache.delete(url);
+    throw err;
+  });
+  return entry;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rdMuxCache) {
+    if (now - entry.lastAccess > RD_CACHE_TTL_MS) {
+      rdMuxCache.delete(key);
+      if (entry.proc && !entry.proc.killed) entry.proc.kill('SIGKILL');
+      if (entry.file) fs.unlink(entry.file, () => {});
+    }
+  }
+}, 60 * 1000).unref();
+
+app.get('/api/rd-prepare-status', (req, res) => {
+  const url = normalizeRdUrl(req.query.url);
+  if (!url) return res.status(400).json({ error: 'bad request' });
+  const entry = getRdEntry(url);
+  res.json({
+    percent: entry.percent,
+    ready: !!entry.file,
+    error: entry.error ? String(entry.error.message || entry.error) : null,
+  });
+});
+
+app.get('/api/rd-stream', async (req, res) => {
+  const url = normalizeRdUrl(req.query.url);
+  const name = req.query.name;
+  if (!url) {
+    return res.status(400).end();
+  }
+  const dispo = contentDispoAttachment(name, 'mp4');
+  const entry = getRdEntry(url);
+  entry.lastAccess = Date.now();
+
+  try {
+    const filePath = await entry.promise;
+    entry.lastAccess = Date.now();
+    res.sendFile(filePath, {
+      headers: {
+        'Content-Type': 'video/mp4',
+        'Content-Disposition': dispo,
+      },
+    }, (err) => {
+      if (err && !res.headersSent) res.status(500).end();
+    });
+  } catch (err) {
+    console.warn(`[rd-stream] ${err.message}: ${(err.stderr || '').slice(0, 300)}`);
+    if (!res.headersSent) res.status(500).end();
+  }
+});
+
+// ---------- SoundCloud ----------
+// yt-dlp resolves SoundCloud URLs and downloads the source audio (mp3 or
+// AAC depending on what SoundCloud serves), then ffmpeg transcodes to
+// 320 kbps CBR MP3 via the bundled ffmpeg-static binary. Same temp-file
+// + status-poll pattern as YouTube — gives IDM exact Content-Length and
+// Range support, with a "Preparing X%" indicator while the audio is
+// being prepared.
+//
+// Honest caveat about bitrate: most public SoundCloud tracks are served
+// as 128 kbps MP3 streams. We write the output at 320 kbps CBR for
+// compatibility / "I want max quality MP3" expectations, but transcoding
+// a 128 kbps source to 320 kbps does NOT recover audio quality — it
+// just makes the file larger. Tracks with a downloadable original or
+// higher-quality source (some artists upload 320 kbps or lossless) will
+// genuinely benefit.
+const SC_URL_RE = /^https?:\/\/(www\.|m\.)?soundcloud\.com\//i;
+
+function normalizeScUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (SC_URL_RE.test(s)) return s;
+  if (/^(www\.|m\.)?soundcloud\.com\//i.test(s)) return 'https://' + s;
+  return null;
+}
+
+app.get('/api/sc-info', async (req, res) => {
+  const url = normalizeScUrl(req.query.url);
+  if (!url) {
+    return res.status(400).json({ error: 'Please paste a valid SoundCloud URL' });
+  }
+  try {
+    const t0 = Date.now();
+    console.log(`[sc-info] start: ${url}`);
+    const { stdout } = await ytExec([
+      '--dump-single-json',
+      '--no-warnings',
+      '--no-check-certificate',
+      '--no-playlist',
+      url,
+    ]);
+    console.log(`[sc-info] yt-dlp ok in ${Date.now() - t0}ms`);
+    const info = JSON.parse(stdout);
+
+    // Pick the highest-bitrate audio source so we know what we're transcoding
+    // from. SoundCloud usually exposes mp3_128 (HLS) and sometimes a
+    // downloadable original. yt-dlp's `bestaudio` selects whichever has the
+    // higher abr.
+    const audioFmts = (info.formats || []).filter(f =>
+      (!f.vcodec || f.vcodec === 'none') && f.acodec && f.acodec !== 'none'
+    );
+    const best = audioFmts.sort((a, b) => (Number(b.abr) || 0) - (Number(a.abr) || 0))[0] || null;
+    const sourceAbrKbps = best ? Number(best.abr) || 128 : 128;
+    const duration = Number(info.duration) || 0;
+    // Output is 320 kbps CBR mp3 — estimate that file size for the IDM
+    // dialog. ID3 tag overhead is negligible.
+    const outBitrateKbps = 320;
+    const sizeBytes = duration ? Math.round(outBitrateKbps * 1000 / 8 * duration) : 0;
+
+    res.json({
+      id: info.id,
+      title: info.title || info.track || '',
+      artist: info.uploader || info.artist || info.creator || '',
+      description: (info.description || '').slice(0, 300),
+      cover: info.thumbnail || '',
+      duration,
+      sourceBitrate: sourceAbrKbps,
+      outputBitrate: outBitrateKbps,
+      sizeBytes,
+      ext: 'mp3',
+    });
+  } catch (err) {
+    const msg = (err.stderr || err.message || '').toString();
+    console.error('[sc-info]', msg.slice(0, 400));
+    if (/private|unavailable|not found|410/i.test(msg)) {
+      return res.status(404).json({ error: 'Track unavailable (private, removed, or region-locked)' });
+    }
+    res.status(500).json({ error: 'Failed to fetch track info' });
+  }
+});
+
+// Mux cache for SoundCloud — same pattern as ytMuxCache but produces .mp3
+const scMuxCache = new Map();
+const SC_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function startScMux(url, entry) {
+  // yt-dlp adds the extension itself when -x --audio-format mp3 runs the
+  // ffmpeg postprocess, so we use a %(ext)s placeholder and resolve the
+  // final path after.
+  const tempBase = path.join(
+    os.tmpdir(),
+    `yeti_sc_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+  );
+  const tempPath = tempBase + '.mp3';
+  const args = [
+    '-x',
+    '--audio-format', 'mp3',
+    '--postprocessor-args', 'ffmpeg:-b:a 320k',
+    '-o', tempBase + '.%(ext)s',
+    '--newline',
+    '--progress',
+    '--no-playlist',
+    '--no-warnings',
+    '--no-check-certificate',
+    '--ffmpeg-location', ffmpegPath,
+    url,
+  ];
+  const proc = spawn(ytdlpPath || 'yt-dlp', args, { windowsHide: true });
+  entry.proc = proc;
+
+  let stderrBuf = '';
+  proc.stderr.on('data', (d) => { stderrBuf += d.toString(); });
+  proc.stdout.on('data', (chunk) => {
+    const m = chunk.toString().match(/(\d+(?:\.\d+)?)%/g);
+    if (m && m.length) {
+      const last = m[m.length - 1];
+      // The ffmpeg postprocess restarts progress at 0%, so cap at 95%
+      // until we see the file actually exists (kept simple).
+      entry.percent = Math.min(95, Number(last.slice(0, -1)));
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    proc.on('error', (err) => reject(err));
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        fs.unlink(tempPath, () => {});
+        const err = new Error(`yt-dlp exited ${code}`);
+        err.stderr = stderrBuf;
+        return reject(err);
+      }
+      // Confirm the file exists at the expected path
+      fs.stat(tempPath, (err) => {
+        if (err) {
+          const e = new Error(`mp3 output missing: ${err.message}`);
+          e.stderr = stderrBuf;
+          return reject(e);
+        }
+        entry.percent = 100;
+        entry.file = tempPath;
+        resolve(tempPath);
+      });
+    });
+  });
+}
+
+function getScEntry(url) {
+  let entry = scMuxCache.get(url);
+  if (entry) {
+    entry.lastAccess = Date.now();
+    return entry;
+  }
+  entry = {
+    url, file: null, error: null, proc: null,
+    percent: 0,
+    lastAccess: Date.now(),
+    promise: null,
+  };
+  scMuxCache.set(url, entry);
+  entry.promise = startScMux(url, entry).catch((err) => {
+    entry.error = err;
+    scMuxCache.delete(url);
+    throw err;
+  });
+  return entry;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of scMuxCache) {
+    if (now - entry.lastAccess > SC_CACHE_TTL_MS) {
+      scMuxCache.delete(key);
+      if (entry.proc && !entry.proc.killed) entry.proc.kill('SIGKILL');
+      if (entry.file) fs.unlink(entry.file, () => {});
+    }
+  }
+}, 60 * 1000).unref();
+
+app.get('/api/sc-prepare-status', (req, res) => {
+  const url = normalizeScUrl(req.query.url);
+  if (!url) return res.status(400).json({ error: 'bad request' });
+  const entry = getScEntry(url);
+  res.json({
+    percent: entry.percent,
+    ready: !!entry.file,
+    error: entry.error ? String(entry.error.message || entry.error) : null,
+  });
+});
+
+app.get('/api/sc-stream', async (req, res) => {
+  const url = normalizeScUrl(req.query.url);
+  const name = req.query.name;
+  if (!url) {
+    return res.status(400).end();
+  }
+  const dispo = contentDispoAttachment(name, 'mp3');
+  const entry = getScEntry(url);
+  entry.lastAccess = Date.now();
+
+  try {
+    const filePath = await entry.promise;
+    entry.lastAccess = Date.now();
+    res.sendFile(filePath, {
+      headers: {
+        'Content-Type': 'audio/mpeg',
+        'Content-Disposition': dispo,
+      },
+    }, (err) => {
+      if (err && !res.headersSent) res.status(500).end();
+    });
+  } catch (err) {
+    console.warn(`[sc-stream] ${err.message}: ${(err.stderr || '').slice(0, 300)}`);
+    if (!res.headersSent) res.status(500).end();
   }
 });
 
@@ -2238,7 +3671,7 @@ app.get('/api/tt-video', async (req, res) => {
 
 // Streams a TikTok CDN video URL with the required Referer header,
 // forwarding Range requests and following redirects (tikcdn.io → real CDN).
-const TT_VIDEO_HOST_RE = /^https:\/\/[^/]*(tiktokcdn\.com|tiktokcdn-us\.com|tiktokv\.com|byteoversea\.com|muscdn\.com|tikwm\.com|tikcdn\.io|tokcdn\.com|akamaized\.net)\//;
+const TT_VIDEO_HOST_RE = /^https:\/\/[^/]*(tiktokcdn\.com|tiktokcdn-us\.com|tiktokv\.com|byteoversea\.com|muscdn\.com|tikwm\.com|tikcdn\.io|tokcdn\.com|akamaized\.net|video\.twimg\.com|pbs\.twimg\.com)\//;
 
 app.get('/api/tt-video-proxy', (req, res) => {
   const target = req.query.url;
@@ -2260,12 +3693,15 @@ app.get('/api/tt-video-proxy', (req, res) => {
       return;
     }
     const u = new URL(url);
+    // Twitter CDN URLs need a twitter.com Referer; TikTok needs tiktok.com.
+    // Same proxy handles both — pick by host.
+    const isTwitter = /twimg\.com$/i.test(u.host);
     const opts = {
       host: u.host,
       path: u.pathname + u.search,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.tiktok.com/',
+        'Referer': isTwitter ? 'https://twitter.com/' : 'https://www.tiktok.com/',
         'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Range': req.headers.range || 'bytes=0-',
@@ -2858,6 +4294,162 @@ app.delete('/api/fb-session', (req, res) => {
   removeEnvVar('FB_ACCESS_TOKEN');
   removeEnvVar('FB_USERNAME');
   console.log('[fb-auth] logged out');
+  res.json({ success: true });
+});
+
+// ---------- TikTok Session Management ----------
+// TikTok requires `sessionid` (and usually `tt-target-idc`) cookies for
+// downloading private/age-restricted videos. Same paste-cookies pattern as
+// Facebook — easier than scripting an OAuth flow that TikTok actively
+// blocks anyway.
+app.get('/api/tt-session', (req, res) => {
+  res.json({
+    loggedIn: !!TT_COOKIES,
+    username: ttLoggedUsername || null,
+    userId: TT_USER_ID || null,
+  });
+});
+
+app.get('/tt-auth', (req, res) => {
+  res.send(`<!DOCTYPE html><html><head><title>Login with TikTok</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',sans-serif;background:#f5f3f8;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{background:#fff;border-radius:16px;padding:36px;max-width:440px;width:100%;box-shadow:0 8px 32px rgba(0,0,0,.08)}
+h2{font-size:1.2rem;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.desc{font-size:.82rem;color:#666;margin-bottom:20px;line-height:1.6}
+.steps{background:#f0f2f5;border-radius:10px;padding:16px 20px;margin-bottom:20px;font-size:.78rem;color:#555;line-height:1.8}
+.steps ol{padding-left:20px}
+.steps code{background:#fff;border:1px solid #ddd;padding:1px 6px;border-radius:4px;font-size:.75rem;font-family:monospace}
+.steps .warn{color:#e67e22;font-weight:600;margin-top:6px;font-size:.72rem}
+textarea{width:100%;height:80px;padding:12px;border:2px solid #e0e0e0;border-radius:10px;font-size:.82rem;font-family:monospace;resize:vertical;outline:none;transition:border-color .2s}
+textarea:focus{border-color:#000}
+textarea::placeholder{font-family:'Inter',sans-serif;color:#aaa}
+.actions{margin-top:14px;display:flex;gap:8px;align-items:center}
+.tt-btn{display:inline-flex;align-items:center;gap:8px;background:#000;color:#fff;border:none;padding:12px 24px;border-radius:10px;font-size:.88rem;font-weight:600;cursor:pointer;transition:opacity .2s}
+.tt-btn:hover{opacity:.85}
+.tt-btn:disabled{opacity:.5;cursor:not-allowed}
+.cancel{border:none;background:none;color:#666;font-size:.82rem;cursor:pointer;padding:8px}
+.cancel:hover{color:#333}
+.status{margin-top:14px;font-size:.8rem;display:none}
+.status.show{display:block}
+.status.error{color:#e53935}
+.status.success{color:#2e7d32}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid #ccc;border-top-color:#000;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.open-tt{display:inline-flex;align-items:center;gap:6px;background:#000;color:#fff;border:none;padding:8px 16px;border-radius:8px;font-size:.78rem;font-weight:600;cursor:pointer;text-decoration:none;margin-bottom:14px;transition:opacity .2s}
+.open-tt:hover{opacity:.85}
+</style></head><body>
+<div class="card">
+<h2>
+<svg viewBox="0 0 24 24" width="24" height="24" fill="none"><path d="M19 7.5a5 5 0 01-3-1v6.5a5 5 0 11-5-5v3a2 2 0 102 2V3h2.5A2.5 2.5 0 0018 5.5L19 7.5z" fill="#000"/></svg>
+Login with TikTok
+</h2>
+<p class="desc">Connect your TikTok account to download private or age-restricted videos.</p>
+
+<a class="open-tt" href="https://www.tiktok.com" target="_blank">
+<svg viewBox="0 0 24 24" width="14" height="14" fill="#fff"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+Open TikTok (log in first)
+</a>
+
+<div class="steps">
+<ol>
+<li>Click the button above and <strong>log in</strong> to TikTok</li>
+<li>Once logged in, press <code>F12</code> to open DevTools</li>
+<li>Go to <strong>Application</strong> tab &rarr; <strong>Cookies</strong> &rarr; <code>tiktok.com</code></li>
+<li>Find <code>sessionid</code> and <code>tt-target-idc</code> cookies and copy their values</li>
+<li>Paste both below as: <code>sessionid=VALUE; tt-target-idc=VALUE</code></li>
+</ol>
+<p class="warn">Your credentials never leave your browser. Only session cookies are stored locally.</p>
+</div>
+
+<textarea id="cookies" placeholder="sessionid=abc123...; tt-target-idc=useast2a"></textarea>
+<div class="actions">
+<button class="tt-btn" id="connectBtn" onclick="doConnect()">Connect</button>
+<button class="cancel" onclick="window.close()">Cancel</button>
+</div>
+<div class="status" id="status"></div>
+</div>
+<script>
+async function doConnect(){
+  const raw=document.getElementById('cookies').value.trim();
+  const status=document.getElementById('status');
+  const btn=document.getElementById('connectBtn');
+  if(!raw){status.className='status show error';status.textContent='Please paste your cookies.';return}
+  if(!/sessionid=/.test(raw)){
+    status.className='status show error';
+    status.textContent='Must include sessionid cookie.';
+    return;
+  }
+  btn.disabled=true;
+  status.className='status show';
+  status.innerHTML='<span class="spinner"></span>Connecting...';
+  try{
+    const res=await fetch('/api/tt-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies:raw})});
+    const data=await res.json();
+    if(!res.ok){status.className='status show error';status.textContent=data.error||'Connection failed.';btn.disabled=false;return}
+    status.className='status show success';
+    status.textContent='Connected as @'+(data.username||'unknown')+'! Closing...';
+    if(window.opener){window.opener.postMessage({type:'tt-login-success',username:data.username},'*')}
+    setTimeout(()=>window.close(),1500);
+  }catch(e){status.className='status show error';status.textContent='Connection failed.';btn.disabled=false}
+}
+</script></body></html>`);
+});
+
+app.post('/api/tt-login', async (req, res) => {
+  const { cookies } = req.body;
+  if (!cookies || !/sessionid=/.test(cookies)) {
+    return res.status(400).json({ error: 'Please provide a sessionid cookie.' });
+  }
+
+  const TT_WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
+
+  try {
+    const cookieStr = cookies.trim();
+
+    // Validate by hitting a logged-in-only TikTok endpoint. The For You
+    // feed page returns user data in __UNIVERSAL_DATA_FOR_REHYDRATION__
+    // when authenticated. We don't strictly require username — connect
+    // succeeds as long as TikTok doesn't bounce the cookie.
+    const probeRes = await httpsGet('https://www.tiktok.com/foryou', {
+      'User-Agent': TT_WEB_UA,
+      'Cookie': cookieStr,
+      'Accept': 'text/html,application/xhtml+xml',
+    });
+
+    if (probeRes.status !== 200) {
+      return res.status(401).json({ error: 'TikTok rejected the cookie. Get a fresh sessionid from your browser.' });
+    }
+
+    // Best-effort username extraction from the embedded JSON. If we can't
+    // find it, just store the cookies and call the user "unknown" — yt-dlp
+    // doesn't need the display name to authenticate.
+    let username = '';
+    const m = probeRes.body.match(/"uniqueId"\s*:\s*"([A-Za-z0-9._]{1,40})"/);
+    if (m) username = m[1];
+
+    TT_COOKIES = cookieStr;
+    ttLoggedUsername = username || '';
+
+    saveEnvVar('TT_COOKIES', TT_COOKIES);
+    if (ttLoggedUsername) saveEnvVar('TT_USERNAME', ttLoggedUsername);
+    else removeEnvVar('TT_USERNAME');
+
+    console.log(`[tt-auth] connected${username ? ` as @${username}` : ''}`);
+    res.json({ success: true, username: username || null });
+  } catch (err) {
+    console.error('[tt-auth] login error:', err.message);
+    res.status(500).json({ error: 'Login failed. Please try again.' });
+  }
+});
+
+app.delete('/api/tt-session', (req, res) => {
+  TT_COOKIES = '';
+  TT_USER_ID = '';
+  ttLoggedUsername = '';
+  removeEnvVar('TT_COOKIES');
+  removeEnvVar('TT_USERNAME');
+  console.log('[tt-auth] logged out');
   res.json({ success: true });
 });
 

@@ -6,6 +6,10 @@ export const useUiStore = defineStore('ui', () => {
   const loading = ref(false);
   const errorMessage = ref('');
   const authWarn = ref({ visible: false, message: '', showLogin: false, html: null });
+  // Top-level view selector. 'main' = the platform downloader (search, results, etc).
+  // 'sessions' = the Logged-in Sessions management page. Acts as a tiny
+  // single-state router without pulling in vue-router.
+  const view = ref('main');
 
   function toggleSidebar() {
     sidebarOpen.value = !sidebarOpen.value;
@@ -25,11 +29,16 @@ export const useUiStore = defineStore('ui', () => {
   function hideAuthWarn() {
     authWarn.value = { visible: false, message: '', showLogin: false, html: null };
   }
+  function setView(v) {
+    view.value = v;
+    sidebarOpen.value = false;
+  }
 
   return {
-    sidebarOpen, loading, errorMessage, authWarn,
+    sidebarOpen, loading, errorMessage, authWarn, view,
     toggleSidebar, closeSidebar,
     showError, clearError,
     showAuthWarn, hideAuthWarn,
+    setView,
   };
 });
