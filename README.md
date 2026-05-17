@@ -2,13 +2,13 @@
 
 A sleek, all-in-one social media downloader that lets you save profile pictures, posts, reels, stories, and videos from multiple platforms — built on **Nuxt 3** with server-side rendering so every platform has its own SEO-indexable URL.
 
-![Yeti Media Downloader](screen.png)
+![Yeti Media Downloader](screenshot.png)
 
 ## Supported Platforms
 
 | Platform | Features |
 |----------|----------|
-| **Instagram** | Profile pictures (HD), posts, reels, stories, highlights, carousel albums. Supports private profiles via login. |
+| **Instagram** | Profile pictures (HD), posts, reels, stories, highlights, carousel albums, single-post URL lookup. Tabbed results view with one-click "Download all" zip per tab. Supports private profiles via login. |
 | **Facebook** | Profile pictures, page logos, public + login-gated video downloads |
 | **Threads** | Profile pictures, follower stats |
 | **TikTok** | Profile pictures, **original 1080p no-watermark** video downloads (parses tikdownloader.io's HD anchor + decodes the snapcdn JWT to fetch the `_original.mp4` straight from TikTok's CDN — multi-extractor fallback to ssstik / mobile API / tikwm) |
@@ -64,7 +64,7 @@ You can also log in directly from the app's sidebar.
 1. **Pick a platform** from the landing-page grid (or go directly to `/tiktok`, `/instagram`, etc.)
 2. **Enter a username or paste a URL** in the search bar (Instagram autocompletes as you type)
 3. **Click Fetch** to load the profile or media
-4. **Browse and download** — click any post, story, or highlight to preview and download
+4. **Browse and download** — click any post, story, or highlight to preview and download. On Instagram the result splits into Profile / Stories / Highlights / Photos / Reels / Videos tabs, each with its own "Download all" zip button.
 
 Each platform is its own URL (`/tiktok`, `/tiktok-videos`, `/youtube`, …) so links are shareable and bookmarkable. Switching between them is client-side — the sidebar and modals stay mounted, so it feels like one continuous page.
 
