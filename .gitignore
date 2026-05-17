@@ -8,3 +8,7 @@ Thumbs.db
 desktop.ini
 dist/
 .vite/
+.nuxt/
+.output/
+.data/
+feedback.jsonl
